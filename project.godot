@@ -1,0 +1,39 @@
+; Pixel Breakout — standalone Godot 4.7.2 project.
+; Portrait 540x960, GL Compatibility, zero gravity.
+; One project = one main scene (the menu) + the autoload list below.
+
+config_version=5
+
+[application]
+
+config/name="Pixel Breakout"
+config/description="Pixel-art brick-breaker. The brick field is a portrait; a carved Y channel gives the ball two paths."
+run/main_scene="res://scenes/menu.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+config/icon="res://icon.svg"
+
+[autoload]
+
+Game="*res://autoload/game.gd"
+TestRunner="*res://autoload/test_runner.gd"
+AudioManager="*res://scripts/audio_manager.gd"
+GameRecorder="*res://scripts/game_recorder.gd"
+RecordSession="*res://scripts/record_session.gd"
+
+[display]
+
+window/size/viewport_width=540
+window/size/viewport_height=960
+window/stretch/mode="canvas_items"
+window/handheld/orientation=1
+
+[physics]
+
+2d/default_gravity=0.0
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+anti_aliasing/quality/msaa_2d=1
+environment/defaults/default_clear_color=Color(0.02, 0.02, 0.025, 1)

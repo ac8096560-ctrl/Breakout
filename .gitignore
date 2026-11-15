@@ -1,0 +1,7 @@
+.godot/
+backups/*
+# keep the ignore marker itself: a backup copy of a class_name script inside
+# backups/ makes Godot register a DUPLICATE global class and silently run the
+# old copy
+!backups/.gdignore
+*.log
