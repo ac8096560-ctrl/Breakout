@@ -1,8 +1,14 @@
 class_name PowerUp extends Node2D
 ## A falling power-up. Stage A ships the "+3" multi-ball in two colours (blue
 ## and green — the reference shows no behavioural difference between them).
-## The gold "x3" triples the balls in play (up to MAX_BALLS); it falls and is
-## caught exactly like "+3".
+## The gold "x3" triples the balls in play (up to MAX_BALLS).
+##
+## Stage B adds the two remaining reference drops, drawn so they read at a
+## glance and never rely on a font glyph:
+##   "minus"  orange circle with a white bar   -> takes one ball out of play
+##   "star"   yellow circle with a white star  -> score bonus + x3 for 5 s
+##
+## The scene decides what a catch MEANS; this node only falls and draws itself.
 ##
 ## It falls STRAIGHT DOWN, must be caught by the paddle, and is simply lost if
 ## it exits the bottom of the screen. Collection is decided by the scene
@@ -47,9 +53,25 @@ func _draw() -> void:
 	draw_circle(Vector2.ZERO, RADIUS + 1.5, Color(0, 0, 0, 0.45))
 	draw_circle(Vector2.ZERO, RADIUS, tint)
 	draw_arc(Vector2.ZERO, RADIUS - 1.0, 0.0, TAU, 24, Color(1, 1, 1, 0.55), 1.5)
-	if kind == "plus3":
-		draw_string(font, Vector2(-8, 4), "+3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
-			Color(1, 1, 1, 0.96))
-	elif kind == "times3":
-		draw_string(font, Vector2(-8, 4), "x3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
-			Color(1, 1, 1, 0.96))
+	match kind:
+		"plus3":
+			draw_string(font, Vector2(-8, 4), "+3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
+				Color(1, 1, 1, 0.96))
+		"times3":
+			draw_string(font, Vector2(-8, 4), "x3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
+				Color(1, 1, 1, 0.96))
+		"minus":
+			# a drawn bar, not a "-" glyph: the debuff must read at 9 px
+			draw_line(Vector2(-5.0, 0), Vector2(5.0, 0), Color(1, 1, 1, 0.96), 2.6)
+		"star":
+			_draw_star(Color(1, 1, 1, 0.96))
+
+
+## A white five-pointed star, drawn from a polygon (no font dependency).
+func _draw_star(col: Color) -> void:
+	var pts := PackedVector2Array()
+	for i in 10:
+		var r := 6.0 if i % 2 == 0 else 2.6
+		var a := -PI * 0.5 + float(i) * PI / 5.0
+		pts.append(Vector2(cos(a), sin(a)) * r)
+	draw_colored_polygon(pts, col)

@@ -65,6 +65,12 @@ func _build_title() -> void:
 
 
 func _build_buttons() -> void:
+	# Stage B: the designer mode lives one tap from the menu.
+	var editor := UITheme.button("LEVEL EDITOR", 15, Color(0.30, 0.72, 0.62), Vector2(300, 44))
+	editor.position = Vector2(120, 502)
+	editor.pressed.connect(func() -> void: Game.goto_editor())
+	add_child(editor)
+
 	_level_btn = UITheme.button(_level_text(), 14, Color(0.95, 0.75, 0.35), Vector2(300, 44))
 	_level_btn.position = Vector2(120, 560)
 	_level_btn.pressed.connect(func() -> void:

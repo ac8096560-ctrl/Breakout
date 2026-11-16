@@ -12,6 +12,7 @@ var _score: Label
 var _lives: Label
 var _bricks: Label
 var _level: Label
+var _mult: Label
 var _dim: ColorRect
 var _popup: Panel
 var _title: Label
@@ -50,6 +51,15 @@ func _build_top() -> void:
 	_level.size = Vector2(290, 16)
 	_level.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	add_child(_level)
+
+	# The star bonus multiplier, shown only while it runs (the paddle badge is a
+	# separate status indicator and is left exactly as it was).
+	_mult = UITheme.label("", 12, Color(0.99, 0.85, 0.35), 3, Color(0, 0, 0, 0.85))
+	_mult.position = Vector2(190, 4)
+	_mult.size = Vector2(180, 18)
+	_mult.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_mult.visible = false
+	add_child(_mult)
 
 
 func _build_result() -> void:
@@ -95,6 +105,10 @@ func _process(_delta: float) -> void:
 	_lives.text = "LIVES %d" % int(game.lives)
 	_bricks.text = "BRICKS %d" % int(game.bricks_left)
 	_level.text = "%s  •  SEED %d" % [str(game.level.get("name", "")), int(game.seed_value)]
+	var mult := int(game.score_mult)
+	_mult.visible = mult > 1
+	if mult > 1:
+		_mult.text = "x%d  %.1fs" % [mult, float(game.star_left)]
 
 
 func show_win(score: int, seconds: float) -> void:

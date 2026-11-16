@@ -47,9 +47,17 @@ const MAX_POWERUPS := 40
 ## a take (whichever brick that turns out to be — the outcome still comes from
 ## play, nothing is scripted).
 const POWERUP_CHANCE := 0.20
-## 30% of power-up drops are the gold "x3" (triples the balls in play); the
-## rest are the blue/green "+3" (adds 3 balls).
-const TIMES3_CHANCE := 0.30
+## The drop pool. "+3"/"x3" keep the reference's multi-ball rhythm; the two
+## Stage B drops stay rare so the first multi-ball still lands around t=8 s and
+## a take still wins in about 70 s.
+const DROP_WEIGHTS := {"plus3": 0.60, "times3": 0.25, "minus": 0.10, "star": 0.05}
+## Stage B DESIGN CHOICES (the reference study does not resolve these):
+##   orange "—"  removes exactly ONE ball, and does nothing at one ball, so the
+##               debuff can never cause a loss by itself.
+##   yellow star  a flat STAR_BONUS plus a x3 brick-score multiplier for 5 s.
+const STAR_BONUS := 250
+const STAR_MULT := 3
+const STAR_SECONDS := 5.0
 const FIRST_DROP_BRICKS := 30
 ## Nothing falls during the opening beat, so the take starts on ONE ball like
 ## the reference (whose first multi-ball lands around t=8s) instead of flooding
@@ -74,6 +82,8 @@ var grid: Array = []
 var bricks_total := 0
 var bricks_left := 0
 var score := 0
+var score_mult := 1        # star bonus multiplier (1 = none)
+var star_left := 0.0       # seconds of x3 left
 var lives := START_LIVES
 var state := STATE_READY
 var elapsed := 0.0
@@ -201,7 +211,9 @@ func _build_walls() -> void:
 
 
 func _load_level() -> void:
-	var path := "res://data/levels/%s.json" % Game.level_id
+	# Game resolves the path: a level played from the editor is an explicit
+	# user:// file, otherwise the shipped folder, otherwise user:// by id.
+	var path := Game.level_json_path()
 	level = BreakoutLevel.load_level(path)
 	if not bool(level.get("ok", false)):
 		push_error("level load failed: %s" % str(level.get("err", "")))
@@ -287,6 +299,7 @@ func _physics_process(delta: float) -> void:
 			elapsed += delta
 			_update_paddle(delta)
 			_tick_powerups(delta)
+			_tick_star(delta)
 			_tick_balls()
 			peak_balls = maxi(peak_balls, _balls.size())
 		STATE_BALL_LOST:
@@ -340,6 +353,10 @@ func _finish(won: bool) -> void:
 	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
 		return
 	state = STATE_LEVEL_CLEAR if won else STATE_GAME_OVER
+	# Freeze FIRST: from this instant no ball or falling power-up may move or
+	# break a brick, so the popup's score is exactly the HUD's score (the
+	# defect this fixes was popup 18700 vs HUD 18850).
+	_freeze_world()
 	AudioManager.play("victory" if won else "defeat")
 	if won and hud != null:
 		hud.show_win(score, elapsed)
@@ -429,10 +446,14 @@ func _lead_x(b: Ball) -> float:
 func _input(event: InputEvent) -> void:
 	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
 		if event is InputEventMouseButton and (event as InputEventMouseButton).pressed:
-			Game.goto_menu()
+			# A take launched from the editor goes back to the editor, not the menu.
+			if Game.editor_return:
+				Game.goto_editor()
+			else:
+				Game.goto_menu()
 		elif event is InputEventKey and (event as InputEventKey).pressed \
 				and (event as InputEventKey).keycode == KEY_R:
-			Game.start_game(seed_value)
+			Game.restart_game()
 		return
 	if event is InputEventMouseMotion:
 		auto_play = false
@@ -500,6 +521,10 @@ func _add_balls(n: int, at: Vector2) -> int:
 
 # ------------------------------------------------------------------ bricks
 func break_cell(c: Vector2i, silent := false) -> void:
+	# Once the level is clear (or the take is over) nothing may break, score or
+	# drop: the freeze is only complete if the scoring path itself is closed.
+	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
+		return
 	if not _bodies.has(c):
 		return
 	var brick: Brick = _bodies[c]
@@ -512,7 +537,7 @@ func break_cell(c: Vector2i, silent := false) -> void:
 		grid[c.y * cols + c.x] = Color(0, 0, 0, 0)
 	bricks_left -= 1
 	brick_hits += 1
-	score += 10
+	score += 10 * score_mult
 	field.queue_redraw()
 	var p := cell_center(c)
 	if not silent:
@@ -535,17 +560,35 @@ func break_cell(c: Vector2i, silent := false) -> void:
 
 
 # ------------------------------------------------------------------ power-ups
+## The drop pool in ONE place, so the drop-rate suite measures exactly the code
+## gameplay runs. The fixed order also keeps rng consumption deterministic.
+func _pick_powerup_kind() -> String:
+	var r := rng.randf()
+	var acc := 0.0
+	for kind in ["plus3", "times3", "minus", "star"]:
+		acc += float(DROP_WEIGHTS[kind])
+		if r < acc:
+			return kind
+	return "star"
+
+
 func _drop_powerup(at: Vector2) -> void:
+	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
+		return
 	if _powerups.size() >= MAX_POWERUPS:
 		return
 	var p := PowerUp.new()
-	if rng.randf() < TIMES3_CHANCE:
-		p.kind = "times3"
-		p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
-	else:
-		p.kind = "plus3"
-		p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
-			else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
+	p.kind = _pick_powerup_kind()
+	match p.kind:
+		"times3":
+			p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
+		"minus":
+			p.tint = pal.get("powerup_orange", Color(0.95, 0.52, 0.15))
+		"star":
+			p.tint = pal.get("star", Color(0.98, 0.82, 0.28))
+		_:
+			p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
+				else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
 	p.position = Vector2(clampf(at.x, PowerUp.RADIUS, VIEW.x - PowerUp.RADIUS), at.y)
 	powerups_root.add_child(p)
 	_powerups.append(p)
@@ -583,13 +626,61 @@ func _collect_powerup(up: PowerUp) -> void:
 	powerups_caught += 1
 	AudioManager.play("powerup")
 	FX.ring(fx_root, at, pal.get("powerup_blue", Color(0.22, 0.48, 0.92)), 26.0, 0.40)
-	if first_multiball_at < 0.0:
+	if first_multiball_at < 0.0 and (up.kind == "plus3" or up.kind == "times3"):
 		first_multiball_at = elapsed
-	if up.kind == "times3":
-		_multiply_balls(3, at)
-	else:
-		_add_balls(3, at)
+	match up.kind:
+		"times3":
+			_multiply_balls(3, at)
+		"minus":
+			# DESIGN CHOICE: -1 ball; a single remaining ball is never taken.
+			_remove_one_ball()
+		"star":
+			# DESIGN CHOICE: flat bonus + x3 brick score for STAR_SECONDS.
+			score += STAR_BONUS
+			score_mult = STAR_MULT
+			star_left = STAR_SECONDS
+		_:
+			_add_balls(3, at)
 	paddle.show_buff(BUFF_SECONDS)
+
+
+## Take exactly one ball out of play. Returns false (and does nothing) at one
+## ball, so the orange debuff can never end a take by itself.
+func _remove_one_ball() -> bool:
+	if _balls.size() <= 1:
+		return false
+	var b: Ball = _balls.pop_back()
+	if is_instance_valid(b):
+		b.active = false
+		b.vel = Vector2.ZERO
+		b.queue_free()
+	return true
+
+
+func _tick_star(delta: float) -> void:
+	if score_mult <= 1:
+		return
+	star_left = maxf(0.0, star_left - delta)
+	if star_left <= 0.0:
+		star_left = 0.0
+		score_mult = 1
+
+
+## The win / game-over freeze. Ball and PowerUp move in their OWN _physics_process,
+## so leaving the flow state alone is not enough: every one of them is stopped
+## here, and the lists are emptied so nothing can be scored after the popup.
+func _freeze_world() -> void:
+	for b in _balls:
+		if is_instance_valid(b):
+			(b as Ball).active = false
+			(b as Ball).vel = Vector2.ZERO
+	_balls.clear()
+	for p in _powerups:
+		if is_instance_valid(p):
+			(p as PowerUp).alive = false
+			p.queue_free()
+	_powerups.clear()
+	_held_ball = null
 
 
 # ------------------------------------------------------------------ reporting / tests
