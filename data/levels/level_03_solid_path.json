@@ -1,0 +1,47 @@
+{
+ "id": "level_03_solid_path",
+ "display_name": "SOLID PATH",
+ "topic": "guide-channel levels (carved channel guides the ball to the portrait; no unbreakable cells — solid walls stall auto-play)",
+ "image": "level_03_solid_path.png",
+ "cols": 40,
+ "rows": 50,
+ "cell": 12.0,
+ "origin": [
+  30,
+  64
+ ],
+ "pattern": "solid guide channel on one side -> funnels the ball to the portrait -> portrait revealed in a controlled sequence. The channel is a narrow carved corridor (cols 5..6, rows 16..44) that runs from the bottom edge straight up to the portrait's chin and ends directly under it, and no portrait pixel is changed. The level has ZERO unbreakable_cells: an unbreakable brick's horizontal bottom face plus the near-vertical auto-play return make any column of black play floor under it a permanent ping-pong channel (measured with --breakout-sim at time_scale 1 - see the report). Every cell the ball can touch is breakable, so every contact is progress.",
+ "channel": {
+  "fork": [
+   5,
+   16
+  ],
+  "stem_cols": [
+   5,
+   6
+  ],
+  "stem_bottom": 44,
+  "arm_width": 1,
+  "arms": [
+   [
+    5,
+    40
+   ],
+   [
+    6,
+    40
+   ]
+  ]
+ },
+ "powerup_tips": [
+  [
+   6,
+   14
+  ],
+  [
+   6,
+   45
+  ]
+ ],
+ "unbreakable_cells": []
+}

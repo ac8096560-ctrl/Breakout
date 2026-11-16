@@ -29,6 +29,8 @@ const THEMES := {
 		"powerup_orange": Color(0.95, 0.52, 0.15),
 		"game_over": Color(0.86, 0.28, 0.26),
 		"star": Color(0.98, 0.82, 0.28),
+		"safety_floor": Color(0.30, 0.90, 0.95),
+		"guide": Color(0.46, 0.48, 0.52),
 	},
 	# A cool alternative palette — same geometry, different mood.
 	"neon": {
@@ -50,6 +52,8 @@ const THEMES := {
 		"powerup_orange": Color(0.97, 0.56, 0.18),
 		"game_over": Color(0.95, 0.42, 0.42),
 		"star": Color(0.98, 0.86, 0.32),
+		"safety_floor": Color(0.34, 0.94, 0.98),
+		"guide": Color(0.40, 0.46, 0.56),
 	},
 }
 

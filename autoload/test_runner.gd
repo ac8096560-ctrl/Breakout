@@ -31,6 +31,8 @@ func _ready() -> void:
 		call_deferred("_suite_smoke")
 	elif _args.has("--breakout-pace"):
 		call_deferred("_suite_pace")
+	elif _args.has("--breakout-sim"):
+		call_deferred("_suite_sim")
 	elif _args.has("--breakout-record"):
 		call_deferred("_suite_record")
 
@@ -88,6 +90,36 @@ func _suite_all() -> void:
 	g3.debug_force_play()
 	await _check_unbreakable_border(g3)
 	g3.queue_free()
+	await get_tree().process_frame
+
+	# ---------------- Stage C (Brief 20) ----------------------------------
+	Game.level_id = "level_01_portrait"
+	await _check_level03()
+
+	var g4: Node = await _new_game()
+	g4.debug_force_play()
+	await _check_times3_in_place(g4)
+	await _check_times3_cap(g4)
+	await _check_combo(g4)
+	g4.queue_free()
+	await get_tree().process_frame
+
+	var g5: Node = await _new_game()
+	g5.debug_force_play()
+	await _check_safety_floor(g5)
+	g5.queue_free()
+	await get_tree().process_frame
+
+	var g6: Node = await _new_game()
+	g6.debug_force_play()
+	await _check_stars(g6)
+	g6.queue_free()
+	await get_tree().process_frame
+
+	var g7: Node = await _new_game()
+	g7.debug_force_play()
+	await _check_stars_three(g7)
+	g7.queue_free()
 	await get_tree().process_frame
 
 	await _report("WR_BREAKOUT_RESULT", _fails == 0, "failing suites: %d" % _fails)
@@ -359,12 +391,14 @@ func _check_powerup_minus(g: Node) -> void:
 
 
 ## The yellow star pays the flat bonus, triples brick score while it runs and
-## expires after 5 s.
+## expires after 5 s. The Stage C combo is reset first: this suite measures the
+## STAR multiplier on ONE brick, not the chain that brick happened to join.
 func _check_powerup_star(g: Node) -> void:
 	g.debug_ensure_playing()
 	g.debug_clear_balls()
 	g.debug_spawn_ball(Vector2(270, 600), Vector2(0, -420))
 	g.debug_ensure_playing()
+	g.debug_reset_combo()
 	await get_tree().physics_frame
 	var score0 := int(g.score)
 	g.debug_spawn_powerup_at_paddle("star")
@@ -380,6 +414,7 @@ func _check_powerup_star(g: Node) -> void:
 			continue
 		target = cellc
 		break
+	g.debug_reset_combo()
 	var scored := 0
 	if target.x >= 0:
 		var s0 := int(g.score)
@@ -401,10 +436,10 @@ func _check_powerup_star(g: Node) -> void:
 
 
 ## The drop pool: measured rates over a fixed-seed sample of the SAME picker
-## gameplay uses (+3 60%, x3 25%, minus 10%, star 5%).
+## gameplay uses. Stage C pool: +3 55%, x3 20%, minus 10%, star 5%, floor 10%.
 func _check_drop_pool(g: Node) -> void:
 	var n := 2000
-	var counts := {"plus3": 0, "times3": 0, "minus": 0, "star": 0}
+	var counts := {"plus3": 0, "times3": 0, "minus": 0, "star": 0, "floor": 0}
 	g.rng.seed = 20261116
 	for i in n:
 		counts[g._pick_powerup_kind()] += 1
@@ -412,10 +447,508 @@ func _check_drop_pool(g: Node) -> void:
 	var r_times := float(counts["times3"]) / float(n)
 	var r_minus := float(counts["minus"]) / float(n)
 	var r_star := float(counts["star"]) / float(n)
-	var ok := absf(r_plus - 0.60) < 0.04 and absf(r_times - 0.25) < 0.04 \
-		and absf(r_minus - 0.10) < 0.03 and absf(r_star - 0.05) < 0.02
-	_suite("drop_pool", ok, "plus3=%.1f%% times3=%.1f%% minus=%.1f%% star=%.1f%% (n=%d)" % [
-		r_plus * 100.0, r_times * 100.0, r_minus * 100.0, r_star * 100.0, n])
+	var r_floor := float(counts["floor"]) / float(n)
+	var total := r_plus + r_times + r_minus + r_star + r_floor
+	var ok := absf(r_plus - 0.55) < 0.04 and absf(r_times - 0.20) < 0.04 \
+		and absf(r_minus - 0.10) < 0.03 and absf(r_star - 0.05) < 0.02 \
+		and absf(r_floor - 0.10) < 0.03 and absf(total - 1.0) < 0.001
+	_suite("drop_pool", ok, "plus3=%.1f%% times3=%.1f%% minus=%.1f%% star=%.1f%% floor=%.1f%% sum=%.3f (n=%d)" % [
+		r_plus * 100.0, r_times * 100.0, r_minus * 100.0, r_star * 100.0,
+		r_floor * 100.0, total, n])
+
+
+# ================================================================== Stage C
+# Brief 20: x3 in-place split, 3-star collectible, safety floor, the solid
+# guide-path level and the combo chain.
+
+## A ball parked BELOW the brick field moving sideways: it keeps the flow in
+## STATE_PLAYING (so the timers tick) without ever breaking a brick.
+func _park_ball(g: Node) -> void:
+	g.debug_clear_balls()
+	g.debug_clear_powerups()
+	g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+	g.debug_ensure_playing()
+
+
+func _cells_to_break(g: Node, n: int) -> Array:
+	var out: Array = []
+	for c in g._bodies.keys():
+		if out.size() >= n:
+			break
+		if (g._bodies[c] as Brick).unbreakable:
+			continue
+		out.append(c)
+	return out
+
+
+## --- item 1: x3 = Ball Multitude, an IN-PLACE split ----------------------
+func _check_times3_in_place(g: Node) -> void:
+	g.auto_play = false
+	g.debug_ensure_playing()
+	g.debug_clear_balls()
+	var at := Vector2(270.0, 520.0)
+	var parent: Ball = g.debug_spawn_ball(at, Vector2(0, -420))
+	var vel0 := parent.vel
+	var added := int(g._split_balls_in_place())
+	var count := int(g.ball_count())
+	var same_pos := true
+	var speeds_ok := true
+	var vels: Array = []
+	for x in g._balls:
+		var bb := x as Ball
+		if not is_instance_valid(bb):
+			continue
+		if bb.position.distance_to(at) > 0.01:
+			same_pos = false
+		if absf(bb.speed() - 420.0) > 0.5:
+			speeds_ok = false
+		vels.append(bb.vel)
+	var distinct := vels.size() == 3 \
+		and (vels[0] as Vector2).is_equal_approx(vel0) \
+		and not (vels[1] as Vector2).is_equal_approx(vels[0] as Vector2) \
+		and not (vels[2] as Vector2).is_equal_approx(vels[0] as Vector2) \
+		and not (vels[1] as Vector2).is_equal_approx(vels[2] as Vector2)
+	# divergence: half a second later the trio is spread out instead of stacked
+	for i in 30:
+		await get_tree().physics_frame
+	var spread := 0.0
+	if g._balls.size() == 3:
+		var p0: Vector2 = (g._balls[0] as Ball).position
+		spread = maxf(spread, p0.distance_to((g._balls[1] as Ball).position))
+		spread = maxf(spread, p0.distance_to((g._balls[2] as Ball).position))
+	var ok := added == 2 and count == 3 and same_pos and speeds_ok and distinct \
+		and spread > 20.0
+	_suite("times3_in_place", ok,
+		"1 ball -> %d (added %d) same_pos=%s same_speed=%s distinct_vels=%s spread=%.1fpx after 0.5s" % [
+			count, added, str(same_pos), str(speeds_ok), str(distinct), spread])
+
+
+func _check_times3_cap(g: Node) -> void:
+	g.auto_play = false
+	g.debug_ensure_playing()
+	g.debug_clear_balls()
+	for i in 50:
+		g.debug_spawn_ball(Vector2(60.0 + float(i % 20) * 20.0, 600.0 - float(i / 20) * 12.0),
+			Vector2(0, -420))
+	g.debug_ensure_playing()
+	var before := int(g.ball_count())
+	var added := int(g._split_balls_in_place())
+	var after := int(g.ball_count())
+	g.debug_clear_balls()
+	# 120 mirrors BreakoutGame.MAX_BALLS (the harness cannot see the const).
+	var ok := before == 50 and after == 120 and added == 70
+	_suite("times3_cap", ok, "balls %d -> %d (added %d, cap 120)" % [before, after, added])
+
+
+## --- item 5: the combo chain --------------------------------------------
+func _check_combo(g: Node) -> void:
+	g.auto_play = false
+	g.lives = 3
+	_park_ball(g)
+	await get_tree().physics_frame
+	g.debug_reset_combo()
+	var cells := _cells_to_break(g, 10)
+	if cells.size() < 10:
+		_suite("combo_chain", false, "not enough bricks")
+		return
+	var s0 := int(g.score)
+	g.break_cell(cells[0], true)
+	var d1 := int(g.score) - s0
+	var c1 := int(g.combo)
+	var window := float(g._combo_left)
+	g.break_cell(cells[1], true)
+	var d2 := int(g.score) - s0 - d1
+	var c2 := int(g.combo)
+	g.break_cell(cells[2], true)
+	var d3 := int(g.score) - s0 - d1 - d2
+	var c3 := int(g.combo)
+	# --- the HUD, measured with NOTHING in play, so no stray ball can extend
+	# the chain between the breaks and the frame the HUD renders.
+	g.debug_clear_balls()
+	g.debug_clear_powerups()
+	g.debug_reset_combo()
+	g.debug_ensure_playing()
+	for i in 5:
+		g.break_cell(cells[3 + i], true)
+	var c5 := int(g.combo)
+	# TWO process frames: `process_frame` is emitted BEFORE the nodes' _process
+	# runs, so a single await still shows the previous frame's label.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var hud_text := str(g.hud.combo_text())
+	# --- the 1.2 s window: let it lapse in real physics time, then break again
+	_park_ball(g)
+	var frames := 0
+	while int(g.combo) > 1 and frames < 200:
+		g.debug_ensure_playing()
+		await get_tree().physics_frame
+		frames += 1
+	var reset_after := float(frames) / 60.0
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var hud_off := str(g.hud.combo_text()) == ""
+	var s1 := int(g.score)
+	g.break_cell(cells[8], true)
+	var d4 := int(g.score) - s1
+	var c6 := int(g.combo)
+	var ok := d1 == 10 and c1 == 1 \
+		and d2 == 20 and c2 == 2 \
+		and d3 == 30 and c3 == 3 \
+		and absf(window - 1.2) < 0.03 \
+		and c5 == 5 and hud_text == "COMBO x5" \
+		and reset_after >= 1.1 and reset_after <= 1.45 \
+		and d4 == 10 and c6 == 1 and hud_off
+	_suite("combo_chain", ok,
+		"scores %d/%d/%d (combo 1/2/3) window=%.2fs | rapid 5 -> combo %d hud=\"%s\" | reset_after=%.2fs then %d (combo %d) hidden_after=%s" % [
+			d1, d2, d3, window, c5, hud_text, reset_after, d4, c6, str(hud_off)])
+
+
+## --- item 3: the safety floor -------------------------------------------
+func _floor_nodes(g: Node) -> int:
+	var n := 0
+	for c in g.get_children():
+		if c.name == "SafetyFloor":
+			n += 1
+	return n
+
+
+func _check_safety_floor(g: Node) -> void:
+	g.auto_play = false
+	g.lives = 3
+	_park_ball(g)
+	g.paddle.move_to_x(270.0)
+	await get_tree().physics_frame
+
+	# 1) catching the drop raises the floor for 10 s
+	g.debug_spawn_powerup_at_paddle("floor")
+	for i in 8:
+		await get_tree().physics_frame
+	var raised := bool(g.floor_active())
+	var left0 := float(g.floor_left())
+	var drawn: bool = g._floor.visible
+	var one_floor := _floor_nodes(g) == 1
+
+	# 2) it really lasts ~10 s of GAME time, measured from the catch itself
+	Engine.time_scale = 6.0
+	var t_start := float(g.elapsed)
+	var guard := 0
+	while bool(g.floor_active()) and guard < 3000:
+		g.debug_ensure_playing()
+		if int(g.ball_count()) == 0:
+			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+		await get_tree().physics_frame
+		guard += 1
+	var lasted := float(g.elapsed) - t_start
+	Engine.time_scale = 1.0
+	var gone: bool = not bool(g.floor_active()) and not bool(g._floor.visible)
+
+	# 3) raise it again for the bounce tests
+	g.debug_ensure_playing()
+	g.debug_spawn_powerup_at_paddle("floor")
+	for i in 8:
+		await get_tree().physics_frame
+	var up_again := bool(g.floor_active())
+
+	# 4) a ball aimed STRAIGHT DOWN is bounced back, no life lost
+	g.debug_clear_balls()
+	var lives0 := int(g.lives)
+	var down: Ball = g.debug_spawn_ball(Vector2(80.0, 800.0), Vector2(0.0, 420.0))
+	var bounced := false
+	for i in 60:
+		await get_tree().physics_frame
+		if not is_instance_valid(down) or not down.active:
+			break
+		if down.vel.y < -100.0:
+			bounced = true
+			break
+	var no_loss := int(g.lives) == lives0 and int(g.ball_count()) > 0
+
+	# 5) a falling POWER-UP falls straight through the floor
+	var p: PowerUp = g.debug_spawn_powerup_at_paddle("plus3")
+	p.position = Vector2(150.0, 850.0)
+	for i in 40:
+		await get_tree().physics_frame
+	var through := is_instance_valid(p) and p.alive and p.position.y > 890.0
+	if is_instance_valid(p):
+		p.alive = false
+		p.queue_free()
+
+	# 6) a second catch while it is still up REFRESHES the timer (no second floor)
+	var first := float(g.floor_left())
+	var was_active := bool(g.floor_active())
+	for i in 120:
+		g.debug_ensure_playing()
+		if int(g.ball_count()) == 0:
+			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+		await get_tree().physics_frame
+	var mid := float(g.floor_left())
+	g.debug_spawn_powerup_at_paddle("floor")
+	for i in 8:
+		await get_tree().physics_frame
+	var refreshed := float(g.floor_left())
+	var one_again := _floor_nodes(g) == 1
+
+	# 7) after it expires a ball can drop again and it costs a life
+	Engine.time_scale = 6.0
+	var guard2 := 0
+	while bool(g.floor_active()) and guard2 < 3000:
+		g.debug_ensure_playing()
+		if int(g.ball_count()) == 0:
+			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+		await get_tree().physics_frame
+		guard2 += 1
+	Engine.time_scale = 1.0
+	var lives1 := int(g.lives)
+	g.debug_clear_balls()
+	g.debug_ensure_playing()
+	g.paddle.move_to_x(60.0)
+	var fall: Ball = g.debug_spawn_ball(Vector2(400.0, 800.0), Vector2(0.0, 420.0))
+	for i in 40:
+		await get_tree().physics_frame
+		if not is_instance_valid(fall) or not fall.active:
+			break
+	var dropped := int(g.lives) == lives1 - 1
+
+	var ok: bool = raised and left0 > 9.4 and left0 <= 10.01 and drawn and one_floor \
+		and lasted >= 9.4 and lasted <= 10.4 and gone and up_again \
+		and bounced and no_loss and through \
+		and was_active and first > 3.0 and mid < first - 1.5 \
+		and refreshed > 9.4 and one_again and dropped
+	_suite("safety_floor", ok,
+		"raised=%s left=%.2fs drawn=%s single=%s lasted=%.2fs game-time gone=%s re_raised=%s | " % [
+			str(raised), left0, str(drawn), str(one_floor), lasted, str(gone), str(up_again)] \
+		+ "bounce=%s no_life_loss=%s powerup_through=%s | refresh %.2f->%.2f->%.2f (was_active=%s single=%s) | expired_drop_costs_life=%s" % [
+			str(bounced), str(no_loss), str(through), first, mid, refreshed,
+			str(was_active), str(one_again), str(dropped)])
+	g.debug_clear_balls()
+
+
+## --- item 2: the 3-star collectible --------------------------------------
+func _catch_star(g: Node, idx := 0) -> bool:
+	if g._stars.size() <= idx:
+		return false
+	var s := g._stars[idx] as StarPickup
+	s.position = g.paddle.position + Vector2(0, -4)
+	return true
+
+
+func _miss_star(g: Node, idx := 0) -> bool:
+	if g._stars.size() <= idx:
+		return false
+	var s := g._stars[idx] as StarPickup
+	s.position = Vector2(g.paddle.position.x + 220.0, 800.0)
+	return true
+
+
+func _check_stars(g: Node) -> void:
+	g.auto_play = false
+	g.lives = 3
+	_park_ball(g)
+	g.paddle.move_to_x(270.0)
+	await get_tree().physics_frame
+	var total := int(g.bricks_total)
+
+	# 1) TIME milestone: 45 s elapsed drops star 1 long before 25 % of the bricks
+	g.elapsed = 46.0
+	g.debug_break_n(1)
+	for i in 3:
+		await get_tree().physics_frame
+	var time_drop := int(g.star_count()) == 1 and int(g.stars_dropped) == 1
+	var frac_at_drop := float(total - int(g.bricks_left)) / float(total)
+	var small_frac := frac_at_drop < 0.25
+	_catch_star(g, 0)
+	for i in 3:
+		await get_tree().physics_frame
+	var hud1 := str(g.hud.star_display())
+	var caught1 := int(g.stars_collected)
+
+	# 2) BRICK milestone: 50 % broken drops star 2, then it is MISSED
+	g.debug_break_n(int(ceil(float(total) * 0.5)) - (total - int(g.bricks_left)))
+	for i in 3:
+		await get_tree().physics_frame
+	var brick_drop := int(g.star_count()) == 1 and int(g.stars_dropped) == 2
+	_miss_star(g, 0)
+	for i in 3:
+		await get_tree().physics_frame
+	var lost := int(g.stars_lost) == 1 and int(g.stars_collected) == caught1
+
+	# 3) a missed star never re-drops: keep breaking, the milestone stays spent
+	g.debug_break_n(20)
+	for i in 3:
+		await get_tree().physics_frame
+	var no_redrop := int(g.stars_dropped) == 2 and int(g.star_count()) == 0
+
+	# 4) 75 % / time milestone 3 still fires, and a catch is kept
+	g.elapsed = 136.0
+	g.debug_break_n(1)
+	for i in 3:
+		await get_tree().physics_frame
+	var third := int(g.stars_dropped) == 3
+	_catch_star(g, 0)
+	for i in 3:
+		await get_tree().physics_frame
+	var hud2 := str(g.hud.star_display())
+	var caught2 := int(g.stars_collected)
+
+	# 5) the win popup shows exactly what was collected (2 of 3 here)
+	var ended: Array = []
+	g.game_ended.connect(func(res: Dictionary) -> void: ended.append(res))
+	g.debug_clear_all_bricks()
+	await get_tree().process_frame
+	await get_tree().physics_frame
+	var win_stars := int(g.hud.win_stars())
+	var banner := str(g.hud.win_banner_text())
+	var res_stars := -1
+	if ended.size() == 1:
+		res_stars = int((ended[0] as Dictionary).get("stars", -1))
+	var ok := time_drop and small_frac and caught1 == 1 and hud1 == "★☆☆" \
+		and brick_drop and lost and no_redrop and third \
+		and caught2 == 2 and hud2 == "★★☆" \
+		and win_stars == 2 and banner == "" and res_stars == 2 \
+		and str(g.state) == "level_clear"
+	_suite("star_collectible", ok,
+		"time_drop=%s (frac %.3f) caught=%d hud=%s | brick_drop=%s missed_lost=%s no_redrop=%s | third=%s caught=%d hud=%s | win=%d banner=\"%s\" result=%d" % [
+			str(time_drop), frac_at_drop, caught1, hud1,
+			str(brick_drop), str(lost), str(no_redrop), str(third), caught2, hud2,
+			win_stars, banner, res_stars])
+
+
+## Three stars caught, then a win: the "3 STAR!" banner and the count.
+func _check_stars_three(g: Node) -> void:
+	g.auto_play = false
+	g.lives = 3
+	_park_ball(g)
+	g.paddle.move_to_x(270.0)
+	await get_tree().physics_frame
+	var total := int(g.bricks_total)
+	var marks := [0.25, 0.50, 0.75]
+	for frac in marks:
+		g.debug_break_n(int(ceil(float(total) * float(frac))) - (total - int(g.bricks_left)))
+		for i in 3:
+			await get_tree().physics_frame
+		_catch_star(g, 0)
+		for i in 3:
+			await get_tree().physics_frame
+	var caught := int(g.stars_collected)
+	var hud := str(g.hud.star_display())
+	var ended: Array = []
+	g.game_ended.connect(func(res: Dictionary) -> void: ended.append(res))
+	g.debug_clear_all_bricks()
+	await get_tree().process_frame
+	await get_tree().physics_frame
+	var banner := str(g.hud.win_banner_text())
+	var win_stars := int(g.hud.win_stars())
+	var res_stars := -1
+	if ended.size() == 1:
+		res_stars = int((ended[0] as Dictionary).get("stars", -1))
+	var ok := caught == 3 and hud == "★★★" \
+		and win_stars == 3 and banner == "3 STAR!" and res_stars == 3
+	_suite("star_three_win", ok,
+		"caught=%d hud=%s win_stars=%d banner=\"%s\" result=%d" % [
+			caught, hud, win_stars, banner, res_stars])
+
+
+## --- item 4: level_03, the solid guide path -----------------------------
+func _check_level03() -> void:
+	Game.level_id = "level_03_solid_path"
+	var g: Node = await _new_game()
+	g.debug_force_play()
+	g.auto_play = false
+
+	# 1) The trap a real take hit is structurally impossible here: level_03
+	# ships ZERO unbreakable cells, so every brick the ball can touch is
+	# progress. An unbreakable brick has a horizontal bottom face, the auto-play
+	# paddle returns the ball nearly vertically, and the black play floor under
+	# that face becomes a permanent ping-pong channel (measured twice: Muse's
+	# recorded take under the left margin, and a real-time sim of the
+	# walls-to-row-49 build on seed 7, 150 s with 1 brick broken).
+	var walls := 0
+	for cell in (g._bodies as Dictionary).keys():
+		if bool(g.is_unbreakable(cell)):
+			walls += 1
+	# the brick flanking the carved channel (col 4 is empty art in level_01)
+	var guide := Vector2i(8, 20)
+	var before := int(g.bricks_left)
+	var score_before := int(g.score)
+	var broke_cells: Array = []
+	g.brick_broken.connect(func(c: Vector2i) -> void: broke_cells.append(c))
+	g.debug_clear_balls()
+	var b: Ball = g.debug_spawn_ball(g.cell_center(guide) + Vector2(0, 14),
+		Vector2(0, -420))
+	for i in 24:
+		await get_tree().physics_frame
+		if not is_instance_valid(b) or not b.active:
+			break
+		if not broke_cells.is_empty():
+			break
+	var broke := not broke_cells.is_empty()
+	var first := Vector2i(-1, -1)
+	if broke:
+		first = broke_cells[0]
+	# the brick the ball touched must be GONE from the body map (it really was
+	# breakable) and the break must have scored exactly one brick
+	var gone: bool = broke and not (g._bodies as Dictionary).has(first)
+	var gained: bool = int(g.score) > score_before
+	var one: bool = int(g.bricks_left) == before - 1
+
+	_suite("level03_no_unbreakable", walls == 0 and broke and gone and gained and one,
+		"unbreakable_cells=%d touched=%s broke=%s removed=%s scored=%s one=%s" % [
+			walls, str(first), str(broke), str(gone), str(gained), str(one)])
+
+	# 2) the channel delivers the ball to the portrait, in two steps.
+	# GDScript lambdas capture by VALUE, so the recorded breaks go into an
+	# Array (a reference type) instead of into local ints.
+	var hits: Array = []
+	g.brick_broken.connect(func(c: Vector2i) -> void: hits.append(c))
+	var entry_x := float(g.origin.x + (float(g.level["stem_cols"][0])
+		+ float(g.level["stem_cols"][1]) + 1.0) * g.cell * 0.5)
+	# (a) a ball served up the doorway breaks the corridor's mouth first
+	g.debug_clear_balls()
+	g.debug_clear_powerups()
+	g.debug_ensure_playing()
+	g.debug_spawn_ball(Vector2(entry_x, 738.0), Vector2(0, -420))
+	for i in 200:
+		g.lives = 3
+		if int(g.ball_count()) == 0:
+			g.debug_spawn_ball(Vector2(entry_x, 738.0), Vector2(0, -420))
+		g.debug_ensure_playing()
+		await get_tree().physics_frame
+		if not hits.is_empty():
+			break
+	var mouth := Vector2i(-1, -1)
+	if not hits.is_empty():
+		mouth = hits[0]
+	# the mouth is cols 5..7 at the portrait's lower-left edge (rows 43..49)
+	var via_mouth := mouth.x >= 5 and mouth.x <= 7 and mouth.y >= 43
+	# (b) a ball inside the carved corridor climbs it into the portrait
+	g.debug_clear_balls()
+	g.debug_clear_powerups()
+	g.debug_ensure_playing()
+	hits.clear()
+	g.debug_spawn_ball(Vector2(entry_x, 480.0), Vector2(0, -420))
+	var deepest := 99
+	var deep_cell := Vector2i(-1, -1)
+	for i in 200:
+		g.lives = 3
+		if int(g.ball_count()) == 0:
+			g.debug_spawn_ball(Vector2(entry_x, 480.0), Vector2(0, -420))
+		g.debug_ensure_playing()
+		await get_tree().physics_frame
+		for h in hits:
+			var hc: Vector2i = h
+			if hc.y < deepest:
+				deepest = hc.y
+				deep_cell = hc
+		if deepest <= 16:
+			break
+	# the corridor's far end is the portrait's left cheek (rows 9..15, col 6..7)
+	var in_portrait := deepest <= 16 and deep_cell.x >= 5 and deep_cell.x <= 7
+	_suite("level03_guide_path", via_mouth and in_portrait,
+		"entry_x=%.1f first_break=%s via_channel_mouth=%s | corridor climb: deepest=%s row=%d reaches_portrait=%s" % [
+			entry_x, str(mouth), str(via_mouth), str(deep_cell), deepest, str(in_portrait)])
+	g.queue_free()
+	await get_tree().process_frame
+	Game.level_id = "level_01_portrait"
 
 
 # ------------------------------------------------------------------ editor
@@ -550,8 +1083,27 @@ func _suite_smoke() -> void:
 
 
 # ------------------------------------------------------------------ pacing
+func _resolve_level_arg(want: String) -> bool:
+	# A registered level is played by id; anything else (a measurement fixture)
+	# is resolved the same way --breakout-record resolves an editor level.
+	Game.level_id = want
+	Game.play_level_path = ""
+	if Game.LEVELS.has(want):
+		return true
+	var jp := BreakoutLevelWriter.find_json(want)
+	if jp == "":
+		return false
+	Game.play_level_path = jp
+	return true
+
+
 func _suite_pace() -> void:
 	Game.auto_play = true
+	# Optional level selection, so the new guide-path level can be measured:
+	#   --breakout-pace level=level_03_solid_path
+	for a in _args:
+		if str(a).begins_with("level="):
+			_resolve_level_arg(str(a).trim_prefix("level="))
 	Engine.time_scale = 6.0
 	var g: Node = await _new_game()
 	var ended: Array = []
@@ -574,10 +1126,96 @@ func _suite_pace() -> void:
 				float(g._balls[0].position.y) if not (g._balls as Array).is_empty() else -1.0])
 	Engine.time_scale = 1.0
 	var won := ended.size() == 1 and bool((ended[0] as Dictionary).get("won", false))
-	print("WR_BREAKOUT_PACE cleared=%s elapsed=%.1f first_multiball=%.1f peak_balls=%d score=%d bricks_total=%d" % [
-		str(won), float(g.elapsed), first_mb, maxi(peak, int(g.peak_balls)), int(g.score),
-		int(g.bricks_total)])
+	print("WR_BREAKOUT_PACE level=%s cleared=%s elapsed=%.1f first_multiball=%.1f peak_balls=%d score=%d bricks_total=%d stars=%d/%d lost=%d peak_combo=%d" % [
+		str(Game.level_id), str(won), float(g.elapsed), first_mb, maxi(peak, int(g.peak_balls)),
+		int(g.score), int(g.bricks_total), int(g.stars_collected), int(g.stars_dropped),
+		int(g.stars_lost), int(g.peak_combo)])
 	await _report("WR_BREAKOUT_PACE_RESULT", won, "cleared at %.1fs" % float(g.elapsed))
+
+
+# -------------------------------------------------- real-time simulation
+## REAL-TIME winnability measurement.
+##
+## Why this exists: --breakout-pace runs at Engine.time_scale = 6, where a
+## 420 px/s ball moves ~42 px per physics step — enough to skip a 10 px brick or
+## a 1-cell wall. A pace clear is therefore NOT proof that a recorded take wins.
+## This mode runs at time_scale 1 (the exact timestep a take records at) and
+## reports the LONGEST STRETCH WITH NO BRICK BROKEN, which is what a stall looks
+## like from the outside.
+##
+##   --breakout-sim level=level_03_solid_path seconds=200 seed=1
+func _suite_sim() -> void:
+	Game.auto_play = true
+	var want := Game.level_id
+	var secs := 120.0
+	var seedv := 1
+	for a in _args:
+		var s := str(a)
+		if s.begins_with("level="):
+			want = s.trim_prefix("level=")
+		elif s.begins_with("seconds="):
+			secs = float(s.trim_prefix("seconds="))
+		elif s.begins_with("seed="):
+			seedv = int(s.trim_prefix("seed="))
+	if not _resolve_level_arg(want):
+		print("WR_BREAKOUT_SIM level=%s error=level not found" % want)
+		await _report("WR_BREAKOUT_SIM_RESULT", false, "level not found: %s" % want)
+		return
+	Game.game_seed = seedv
+	Engine.time_scale = 1.0
+	var g: Node = await _new_game()
+	if int(g.bricks_left) <= 0:
+		await _report("WR_BREAKOUT_SIM_RESULT", false, "level failed to load")
+		return
+	var ended: Array = []
+	g.game_ended.connect(func(res: Dictionary) -> void: ended.append(res))
+	g.debug_force_play()
+	var hits := 0
+	var last_break_at := 0.0
+	var longest_stall := 0.0
+	var min_x := 1.0e9
+	var max_x := -1.0e9
+	var next_trace := 10.0
+	var t0 := Time.get_ticks_msec()
+	while ended.is_empty() and float(g.elapsed) < secs \
+			and Time.get_ticks_msec() - t0 < int(secs * 1000.0) + 20000:
+		await get_tree().process_frame
+		var now := float(g.elapsed)
+		longest_stall = maxf(longest_stall, now - last_break_at)
+		if int(g.brick_hits) != hits:
+			hits = int(g.brick_hits)
+			last_break_at = now
+		for b in g._balls:
+			if is_instance_valid(b):
+				min_x = minf(min_x, (b as Ball).position.x)
+				max_x = maxf(max_x, (b as Ball).position.x)
+		if now >= next_trace:
+			next_trace += 10.0
+			var bx := -1.0
+			if not (g._balls as Array).is_empty() and is_instance_valid(g._balls[0]):
+				bx = float((g._balls[0] as Ball).position.x)
+			var by := -1.0
+			if not (g._balls as Array).is_empty() and is_instance_valid(g._balls[0]):
+				by = float((g._balls[0] as Ball).position.y)
+			var bv := Vector2.ZERO
+			var bs := 0.0
+			if not (g._balls as Array).is_empty() and is_instance_valid(g._balls[0]):
+				bv = (g._balls[0] as Ball).vel
+				bs = (g._balls[0] as Ball).speed()
+			print("WR_BREAKOUT_SIM_TRACE t=%.0f balls=%d bricks=%d lives=%d score=%d x=%.0f y=%.0f vel=(%.0f,%.0f) spd=%.0f pad=%.0f stall=%.1f" % [
+				now, int(g.ball_count()), int(g.bricks_left), int(g.lives),
+				int(g.score), bx, by, bv.x, bv.y, bs, float(g.paddle.position.x),
+				now - last_break_at])
+	Engine.time_scale = 1.0
+	var won := ended.size() == 1 and bool((ended[0] as Dictionary).get("won", false))
+	print("WR_BREAKOUT_SIM level=%s seed=%d won=%s elapsed=%.1f bricks_left=%d bricks_total=%d score=%d lives=%d hits=%d longest_stall=%.1fs ball_x=[%.0f..%.0f] stars=%d/%d" % [
+		want, seedv, str(won), float(g.elapsed), int(g.bricks_left), int(g.bricks_total),
+		int(g.score), int(g.lives), int(g.brick_hits), longest_stall,
+		min_x if min_x < 1.0e9 else -1.0, max_x if max_x > -1.0e9 else -1.0,
+		int(g.stars_collected), int(g.stars_dropped)])
+	await _report("WR_BREAKOUT_SIM_RESULT", won,
+		"level=%s seed=%d won=%s at %.1fs (longest stall %.1fs, bricks_left %d)" % [
+			want, seedv, str(won), float(g.elapsed), longest_stall, int(g.bricks_left)])
 
 
 # ------------------------------------------------------------------ recording

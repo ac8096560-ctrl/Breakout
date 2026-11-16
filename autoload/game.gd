@@ -3,7 +3,7 @@ extends Node
 ## whether the paddle auto-plays, and the scene changes. This is the Breakout
 ## equivalent of WorldRace's Game autoload, with no race concepts in it.
 
-const LEVELS := ["level_01_portrait", "level_02_jensen"]
+const LEVELS := ["level_01_portrait", "level_02_jensen", "level_03_solid_path"]
 const SEED_OPTIONS := [1, 2, 3, 7, 42]
 const THEME_ID := "rose"
 

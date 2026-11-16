@@ -8,6 +8,12 @@ class_name PowerUp extends Node2D
 ##   "minus"  orange circle with a white bar   -> takes one ball out of play
 ##   "star"   yellow circle with a white star  -> score bonus + x3 for 5 s
 ##
+## Stage C adds the SAFETY FLOOR:
+##   "floor"  cyan capsule with a glowing BAR drawn WIDER than the capsule
+##            -> raises the bouncing floor below the paddle for 10 s
+##            (the overhanging bar is what makes it unmistakable next to the
+##             three round glyph capsules)
+##
 ## The scene decides what a catch MEANS; this node only falls and draws itself.
 ##
 ## It falls STRAIGHT DOWN, must be caught by the paddle, and is simply lost if
@@ -16,6 +22,9 @@ class_name PowerUp extends Node2D
 
 const RADIUS := 9.0
 const FALL_SPEED := 95.0      # ~66 px/s at 360x640, i.e. the reference's rate at 540x960
+## Falling power-ups (including the safety floor's capsule) ignore the safety
+## floor itself: they are plain Node2D movers, so they fall straight through
+## and the player still has to catch them with the paddle.
 const LOST_Y := 1000.0
 
 var kind := "plus3"
@@ -65,6 +74,14 @@ func _draw() -> void:
 			draw_line(Vector2(-5.0, 0), Vector2(5.0, 0), Color(1, 1, 1, 0.96), 2.6)
 		"star":
 			_draw_star(Color(1, 1, 1, 0.96))
+		"floor":
+			# A glowing FLOOR icon that overhangs the capsule on purpose: the
+			# four other drops are round glyphs, this one is a wide bar.
+			draw_rect(Rect2(-14.0, -4.0, 28.0, 8.0), Color(0, 0, 0, 0.35))
+			draw_rect(Rect2(-13.0, -3.0, 26.0, 5.0), Color(1, 1, 1, 0.95))
+			draw_rect(Rect2(-13.0, -3.0, 26.0, 2.0),
+				Color(tint.r, tint.g, tint.b, 0.95))
+			draw_rect(Rect2(-9.0, 3.0, 18.0, 2.0), Color(tint.r, tint.g, tint.b, 0.75))
 
 
 ## A white five-pointed star, drawn from a polygon (no font dependency).

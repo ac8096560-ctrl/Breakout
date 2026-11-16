@@ -47,10 +47,15 @@ const MAX_POWERUPS := 40
 ## a take (whichever brick that turns out to be — the outcome still comes from
 ## play, nothing is scripted).
 const POWERUP_CHANCE := 0.20
-## The drop pool. "+3"/"x3" keep the reference's multi-ball rhythm; the two
-## Stage B drops stay rare so the first multi-ball still lands around t=8 s and
-## a take still wins in about 70 s.
-const DROP_WEIGHTS := {"plus3": 0.60, "times3": 0.25, "minus": 0.10, "star": 0.05}
+## The drop pool (Stage C, item 3). The five kinds sum to exactly 1.0:
+##   +3 55%   x3 20%   minus 10%   star 5%   safety floor 10%
+## "+3"/"x3" keep the reference's multi-ball rhythm; minus/star stay rare so
+## the first multi-ball still lands around t=8 s and a take still wins in
+## about 70 s; the floor is a real defensive drop at 10%.
+const DROP_WEIGHTS := {"plus3": 0.55, "times3": 0.20, "minus": 0.10, "star": 0.05, "floor": 0.10}
+## The fixed pick order. It is also the order the rng is consumed in, so a
+## seeded take stays deterministic.
+const DROP_ORDER := ["plus3", "times3", "minus", "star", "floor"]
 ## Stage B DESIGN CHOICES (the reference study does not resolve these):
 ##   orange "—"  removes exactly ONE ball, and does nothing at one ball, so the
 ##               debuff can never cause a loss by itself.
@@ -59,6 +64,24 @@ const STAR_BONUS := 250
 const STAR_MULT := 3
 const STAR_SECONDS := 5.0
 const FIRST_DROP_BRICKS := 30
+## ---------------- Stage C: the five new rules ------------------------------
+## 1) "x3" is an IN-PLACE split: every ball in play becomes its own ball plus
+##    two siblings at the SAME position, their velocities rotated +-25 deg
+##    around the parent's heading at the same speed, so they visibly diverge.
+const SPLIT_SPREAD_DEG := 25.0
+## 2) The 3-STAR COLLECTIBLE. One star per milestone, at most three per level.
+##    Each milestone fires on WHICHEVER comes first: that share of the
+##    breakable bricks broken, or that elapsed time.
+const STAR_MILESTONES := 3
+const STAR_BRICK_FRACS := [0.25, 0.50, 0.75]
+const STAR_TIMES := [45.0, 90.0, 135.0]
+## 3) The safety floor: 10 s up, below the paddle, bouncing every ball back.
+const FLOOR_SECONDS := SafetyFloor.DURATION
+## 5) The combo chain. 1.2 s between breaks keeps it alive; the multiplier is
+##    the chain length (cap 999) and a brick scores 10 x combo.
+const COMBO_WINDOW := 1.2
+const COMBO_MAX := 999
+const COMBO_SCORE := 10
 ## Nothing falls during the opening beat, so the take starts on ONE ball like
 ## the reference (whose first multi-ball lands around t=8s) instead of flooding
 ## the screen in the first two seconds.
@@ -84,6 +107,10 @@ var bricks_left := 0
 var score := 0
 var score_mult := 1        # star bonus multiplier (1 = none)
 var star_left := 0.0       # seconds of x3 left
+var combo := 1             # Stage C: bricks broken inside COMBO_WINDOW chain
+var stars_collected := 0   # the 3-star collectible: caught this level
+var stars_dropped := 0     # milestones that fired a star
+var stars_lost := 0        # stars the paddle missed (gone for this level)
 var lives := START_LIVES
 var state := STATE_READY
 var elapsed := 0.0
@@ -96,6 +123,7 @@ var powerups_dropped := 0
 var powerups_caught := 0
 var peak_balls := 1
 var brick_hits := 0
+var peak_combo := 1
 
 var rng := RandomNumberGenerator.new()
 var field: BrickField
@@ -103,12 +131,18 @@ var paddle: Paddle
 var bricks_root: Node2D
 var balls_root: Node2D
 var powerups_root: Node2D
+var stars_root: Node2D
 var fx_root: Node2D
 var hud: Control
 
 var _bodies: Dictionary = {}       # Vector2i -> Brick
 var _balls: Array = []
 var _powerups: Array = []
+var _stars: Array = []             # falling 3-star collectibles
+var _star_done: Array = [false, false, false]   # milestone i has fired
+var _star_source := Vector2.ZERO   # last broken brick (a star falls from there)
+var _combo_left := 0.0             # seconds left in the current combo chain
+var _floor: SafetyFloor = null     # the safety-floor bar (one at a time)
 var _tip_cells: Array = []
 var _unbreakable_cells: Array = []  # Vector2i border cells: walls, not bricks
 var _ready_left := READY_SECONDS
@@ -156,6 +190,10 @@ func _build_scene() -> void:
 	powerups_root.name = "PowerUps"
 	add_child(powerups_root)
 
+	stars_root = Node2D.new()
+	stars_root.name = "Stars"
+	add_child(stars_root)
+
 	fx_root = Node2D.new()
 	fx_root.name = "Effects"
 	fx_root.z_index = 8
@@ -168,6 +206,13 @@ func _build_scene() -> void:
 	paddle.pal = pal
 	paddle.position = Vector2(270, PADDLE_Y)
 	add_child(paddle)
+
+	# The safety floor: ONE node, created up-front and hidden, so a catch only
+	# raises the bar and can never spawn a second one.
+	_floor = SafetyFloor.new()
+	_floor.name = "SafetyFloor"
+	_floor.pal = pal
+	add_child(_floor)
 
 	var hud_layer := CanvasLayer.new()
 	hud_layer.name = "HUDLayer"
@@ -300,6 +345,9 @@ func _physics_process(delta: float) -> void:
 			_update_paddle(delta)
 			_tick_powerups(delta)
 			_tick_star(delta)
+			_tick_combo(delta)
+			_tick_floor(delta)
+			_tick_stars(delta)
 			_tick_balls()
 			peak_balls = maxi(peak_balls, _balls.size())
 		STATE_BALL_LOST:
@@ -325,6 +373,15 @@ func _tick_balls() -> void:
 		if not is_instance_valid(b):
 			_balls.erase(b)
 			continue
+		# The safety floor: while it is up EVERY falling ball is bounced back,
+		# so nothing can drop out and cost a life. Reflecting here (instead of
+		# a physics body) makes it exact: no tunnelling at high speed, and no
+		# moment where a ball is between the floor and the loss line.
+		if _floor != null and _floor.active() and b.vel.y > 0.0 \
+				and b.position.y >= SafetyFloor.Y - Ball.RADIUS:
+			b.position.y = SafetyFloor.Y - Ball.RADIUS - 0.5
+			b.vel.y = -absf(b.vel.y)
+			AudioManager.play("bounce", -8.0)
 		if b.position.y > LOSS_Y:
 			b.active = false
 			_balls.erase(b)
@@ -359,7 +416,7 @@ func _finish(won: bool) -> void:
 	_freeze_world()
 	AudioManager.play("victory" if won else "defeat")
 	if won and hud != null:
-		hud.show_win(score, elapsed)
+		hud.show_win(score, elapsed, stars_collected)
 	elif hud != null:
 		hud.show_game_over(score, bricks_left)
 	state_changed.emit(state)
@@ -369,6 +426,8 @@ func _finish(won: bool) -> void:
 		"elapsed": elapsed, "level": level_id, "seed": seed_value,
 		"balls": _balls.size(), "peak_balls": peak_balls,
 		"first_multiball_at": first_multiball_at,
+		"stars": stars_collected, "stars_dropped": stars_dropped,
+		"stars_lost": stars_lost, "peak_combo": peak_combo,
 	})
 
 
@@ -519,6 +578,32 @@ func _add_balls(n: int, at: Vector2) -> int:
 	return added
 
 
+## Stage C item 1 — "Ball Multitude": EVERY ball in play splits into three AT
+## ITS OWN POSITION. The parent keeps its exact position and velocity; two
+## children appear on top of it with the same speed and their headings rotated
+## +25 and -25 degrees, so the trio diverges instead of stacking. The paddle is
+## not involved at all (spawning balls at the paddle is "+3"'s job).
+## Returns how many balls were added; the total is capped at MAX_BALLS, and a
+## triple that would overshoot the cap only adds up to it.
+func _split_balls_in_place() -> int:
+	var parents: Array = _balls.duplicate()
+	var added := 0
+	for parent in parents:
+		if not is_instance_valid(parent):
+			continue
+		var b := parent as Ball
+		# A held or already-lost ball has no heading to spread around.
+		if not b.active or b.vel.length_squared() < 1.0:
+			continue
+		for side in [-1.0, 1.0]:
+			if _balls.size() >= MAX_BALLS:
+				return added
+			var child := _new_ball(b.position)
+			child.launch(b.vel.rotated(deg_to_rad(SPLIT_SPREAD_DEG) * side))
+			added += 1
+	return added
+
+
 # ------------------------------------------------------------------ bricks
 func break_cell(c: Vector2i, silent := false) -> void:
 	# Once the level is clear (or the take is over) nothing may break, score or
@@ -537,9 +622,12 @@ func break_cell(c: Vector2i, silent := false) -> void:
 		grid[c.y * cols + c.x] = Color(0, 0, 0, 0)
 	bricks_left -= 1
 	brick_hits += 1
-	score += 10 * score_mult
+	# Stage C item 5: the combo chain is the brick's multiplier.
+	_bump_combo()
+	score += COMBO_SCORE * combo * score_mult
 	field.queue_redraw()
 	var p := cell_center(c)
+	_star_source = p
 	if not silent:
 		# A small, quick pixel puff: the glow texture is 128 px, so scale_amount
 		# is a fraction — 1.7 (the WorldRace default for racer impacts) would
@@ -555,6 +643,7 @@ func break_cell(c: Vector2i, silent := false) -> void:
 	if bricks_left > 0 and elapsed >= DROP_DELAY \
 			and (was_tip or first_drop or rng.randf() < POWERUP_CHANCE):
 		_drop_powerup(p)
+	_check_star_milestones()
 	if bricks_left <= win_leftover():
 		_finish(true)
 
@@ -565,11 +654,11 @@ func break_cell(c: Vector2i, silent := false) -> void:
 func _pick_powerup_kind() -> String:
 	var r := rng.randf()
 	var acc := 0.0
-	for kind in ["plus3", "times3", "minus", "star"]:
+	for kind in DROP_ORDER:
 		acc += float(DROP_WEIGHTS[kind])
 		if r < acc:
 			return kind
-	return "star"
+	return "floor"
 
 
 func _drop_powerup(at: Vector2) -> void:
@@ -586,6 +675,8 @@ func _drop_powerup(at: Vector2) -> void:
 			p.tint = pal.get("powerup_orange", Color(0.95, 0.52, 0.15))
 		"star":
 			p.tint = pal.get("star", Color(0.98, 0.82, 0.28))
+		"floor":
+			p.tint = pal.get("safety_floor", Color(0.30, 0.90, 0.95))
 		_:
 			p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
 				else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
@@ -611,13 +702,6 @@ func _tick_powerups(_delta: float) -> void:
 			_collect_powerup(up)
 
 
-func _multiply_balls(mult: int, at: Vector2) -> void:
-	var target := mini(_balls.size() * mult, MAX_BALLS)
-	var to_add := target - _balls.size()
-	if to_add > 0:
-		_add_balls(to_add, at)
-
-
 func _collect_powerup(up: PowerUp) -> void:
 	up.alive = false
 	_powerups.erase(up)
@@ -630,7 +714,12 @@ func _collect_powerup(up: PowerUp) -> void:
 		first_multiball_at = elapsed
 	match up.kind:
 		"times3":
-			_multiply_balls(3, at)
+			# Stage C: Ball Multitude splits EVERY ball where it is — the paddle
+			# spawns nothing.
+			_split_balls_in_place()
+		"floor":
+			# One floor only: a second catch REFRESHES the timer.
+			_floor.start(FLOOR_SECONDS)
 		"minus":
 			# DESIGN CHOICE: -1 ball; a single remaining ball is never taken.
 			_remove_one_ball()
@@ -666,6 +755,103 @@ func _tick_star(delta: float) -> void:
 		score_mult = 1
 
 
+# ------------------------------------------------- Stage C: combo (item 5)
+## 1.2 s between breaks keeps the chain alive; the chain length IS the score
+## multiplier (cap 999) and a brick pays 10 x combo (times the Stage B star
+## multiplier when that is running).
+func _tick_combo(delta: float) -> void:
+	if _combo_left <= 0.0:
+		return
+	_combo_left = maxf(0.0, _combo_left - delta)
+	if _combo_left <= 0.0 and combo != 1:
+		combo = 1
+
+
+func _bump_combo() -> void:
+	if _combo_left > 0.0:
+		combo = mini(combo + 1, COMBO_MAX)
+	else:
+		combo = 1
+	_combo_left = COMBO_WINDOW
+	peak_combo = maxi(peak_combo, combo)
+
+
+# ------------------------------------- Stage C: safety floor (item 3)
+func _tick_floor(delta: float) -> void:
+	if _floor != null:
+		_floor.tick(delta)
+
+
+# ------------------------------- Stage C: the 3-star collectible (item 2)
+## Fire at most ONE milestone per call, so two stars can never be spawned on
+## top of each other: the next break (or the next frame's clock check) fires
+## the next one.
+func _check_star_milestones() -> void:
+	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
+		return
+	var broken := maxi(0, bricks_total - bricks_left)
+	var frac := float(broken) / maxf(1.0, float(bricks_total))
+	for i in STAR_MILESTONES:
+		if bool(_star_done[i]):
+			continue
+		# EITHER trigger, whichever comes first, for THIS milestone.
+		if frac >= float(STAR_BRICK_FRACS[i]) or elapsed >= float(STAR_TIMES[i]):
+			_star_done[i] = true
+			_drop_star()
+			return
+
+
+## A star falls from the last broken brick (clamped into the field), or from
+## the top of the field when the clock — not a brick — fired the milestone.
+func _drop_star() -> void:
+	var src := _star_source
+	if src == Vector2.ZERO:
+		src = Vector2(VIEW.x * 0.5, origin.y + cell * 2.0)
+	var s := StarPickup.new()
+	s.position = Vector2(
+		clampf(src.x, StarPickup.RADIUS, VIEW.x - StarPickup.RADIUS),
+		clampf(src.y, origin.y + cell, PADDLE_Y - 220.0))
+	stars_root.add_child(s)
+	_stars.append(s)
+	stars_dropped += 1
+
+
+## Catch or lose every falling star. A star that gets past the paddle is LOST
+## for the level: its milestone is already marked done, so it never re-drops.
+func _tick_stars(_delta: float) -> void:
+	_check_star_milestones()
+	if _stars.is_empty():
+		return
+	var rect := paddle.rect()
+	for s in _stars.duplicate():
+		if not is_instance_valid(s):
+			_stars.erase(s)
+			continue
+		var star := s as StarPickup
+		if not star.alive:
+			_stars.erase(star)
+			continue
+		if star.overlaps(rect):
+			_collect_star(star)
+		elif star.position.y > PADDLE_Y + 24.0:
+			# past the paddle: gone for this level
+			star.alive = false
+			_stars.erase(star)
+			star.queue_free()
+			stars_lost += 1
+
+
+func _collect_star(star: StarPickup) -> void:
+	star.alive = false
+	_stars.erase(star)
+	var at := star.position
+	star.queue_free()
+	stars_collected += 1
+	AudioManager.play("powerup")
+	FX.flash(fx_root, at, pal.get("star", Color(0.98, 0.82, 0.28)), 46.0, 0.45)
+	FX.ring(fx_root, at, pal.get("star", Color(0.98, 0.82, 0.28)), 34.0, 0.50)
+
+
 ## The win / game-over freeze. Ball and PowerUp move in their OWN _physics_process,
 ## so leaving the flow state alone is not enough: every one of them is stopped
 ## here, and the lists are emptied so nothing can be scored after the popup.
@@ -680,6 +866,13 @@ func _freeze_world() -> void:
 			(p as PowerUp).alive = false
 			p.queue_free()
 	_powerups.clear()
+	for s in _stars:
+		if is_instance_valid(s):
+			(s as StarPickup).alive = false
+			s.queue_free()
+	_stars.clear()
+	if _floor != null:
+		_floor.clear()
 	_held_ball = null
 
 
@@ -698,6 +891,26 @@ func ball_count() -> int:
 
 func powerup_count() -> int:
 	return _powerups.size()
+
+
+func star_count() -> int:
+	return _stars.size()
+
+
+func star_pickups() -> Array:
+	return _stars
+
+
+func floor_active() -> bool:
+	return _floor != null and _floor.active()
+
+
+func floor_left() -> float:
+	return 0.0 if _floor == null else _floor.left
+
+
+func combo_value() -> int:
+	return combo
 
 
 func held_ball() -> Ball:
@@ -739,6 +952,16 @@ func debug_spawn_ball(at: Vector2, vel: Vector2) -> Ball:
 	return b
 
 
+## Test housekeeping: drop every falling power-up (a leftover "+3" caught by
+## the paddle would spawn balls that break bricks mid-measurement).
+func debug_clear_powerups() -> void:
+	for p in _powerups.duplicate():
+		if is_instance_valid(p):
+			(p as PowerUp).alive = false
+			p.queue_free()
+	_powerups.clear()
+
+
 func debug_clear_balls() -> void:
 	for b in _balls.duplicate():
 		if is_instance_valid(b):
@@ -752,6 +975,8 @@ func debug_spawn_powerup_at_paddle(kind: String = "plus3") -> PowerUp:
 	p.kind = kind
 	if kind == "times3":
 		p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
+	elif kind == "floor":
+		p.tint = pal.get("safety_floor", Color(0.30, 0.90, 0.95))
 	p.position = paddle.position + Vector2(0, -10)
 	powerups_root.add_child(p)
 	_powerups.append(p)
@@ -766,3 +991,26 @@ func debug_clear_all_bricks() -> void:
 		if b.unbreakable:
 			continue
 		break_cell(c, true)
+
+
+## Break up to `n` breakable bricks silently (the real break_cell path, so
+## scoring, drops, combos and star milestones behave exactly as in play).
+func debug_break_n(n: int) -> int:
+	var broken := 0
+	for c in _bodies.keys():
+		if broken >= n:
+			break
+		var b: Brick = _bodies[c]
+		if b.unbreakable:
+			continue
+		break_cell(c, true)
+		broken += 1
+	return broken
+
+
+## Close the combo chain (a deterministic starting point for the combo and
+## star-multiplier suites, which measure ONE brick's value).
+func debug_reset_combo() -> void:
+	combo = 1
+	_combo_left = 0.0
+	peak_combo = 1

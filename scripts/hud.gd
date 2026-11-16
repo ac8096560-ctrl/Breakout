@@ -13,11 +13,17 @@ var _lives: Label
 var _bricks: Label
 var _level: Label
 var _mult: Label
+var _combo: Label
+var _stars_hud: StarRow
 var _dim: ColorRect
 var _popup: Panel
 var _title: Label
 var _sub: Label
-var _stars: Control
+var _stars: StarRow
+var _star_banner: Label
+## Stars caught on this level (0..3), mirrored from the game each frame.
+var stars_shown := 0
+var combo_shown := 1
 
 
 func bind(g: Node, colors: Dictionary) -> void:
@@ -47,10 +53,27 @@ func _build_top() -> void:
 	add_child(_lives)
 
 	_level = UITheme.label("", 10, Color(0.72, 0.74, 0.78), 3, Color(0, 0, 0, 0.85))
-	_level.position = Vector2(240, 25)
-	_level.size = Vector2(290, 16)
+	_level.position = Vector2(332, 25)
+	_level.size = Vector2(198, 16)
 	_level.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	add_child(_level)
+
+	# Stage C — the 3-star collectible, drawn (no font glyph dependency): three
+	# stars side by side, filled for caught, hollow for not-yet/ lost.
+	_stars_hud = StarRow.new()
+	_stars_hud.position = Vector2(158, 21)
+	_stars_hud.size = Vector2(60, 22)
+	_stars_hud.radius = 7.5
+	_stars_hud.spacing = 20.0
+	add_child(_stars_hud)
+
+	# Stage C — the combo chain, shown only while it is chaining (combo > 1).
+	_combo = UITheme.label("", 12, Color(0.62, 0.94, 1.0), 3, Color(0, 0, 0, 0.85))
+	_combo.position = Vector2(220, 24)
+	_combo.size = Vector2(108, 18)
+	_combo.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_combo.visible = false
+	add_child(_combo)
 
 	# The star bonus multiplier, shown only while it runs (the paddle badge is a
 	# separate status indicator and is left exactly as it was).
@@ -91,6 +114,13 @@ func _build_result() -> void:
 	_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_popup.add_child(_sub)
 
+	_star_banner = UITheme.label("", 22, Color(0.99, 0.86, 0.35), 4, Color(0.35, 0.20, 0.02, 0.9))
+	_star_banner.position = Vector2(0, 4)
+	_star_banner.size = Vector2(420, 28)
+	_star_banner.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_star_banner.visible = false
+	_popup.add_child(_star_banner)
+
 	_stars = StarRow.new()
 	_stars.position = Vector2(0, 146)
 	_stars.size = Vector2(420, 46)
@@ -109,15 +139,30 @@ func _process(_delta: float) -> void:
 	_mult.visible = mult > 1
 	if mult > 1:
 		_mult.text = "x%d  %.1fs" % [mult, float(game.star_left)]
+	if int(game.stars_collected) != stars_shown:
+		stars_shown = int(game.stars_collected)
+		_stars_hud.count = stars_shown
+		_stars_hud.queue_redraw()
+	combo_shown = int(game.combo)
+	_combo.visible = combo_shown > 1
+	if combo_shown > 1:
+		_combo.text = "COMBO x%d" % combo_shown
 
 
-func show_win(score: int, seconds: float) -> void:
+## The win popup: the score line, the three stars this level actually earned,
+## and — when all three were caught — a prominent "3 STAR!" banner.
+func show_win(score: int, seconds: float, stars: int) -> void:
 	_dim.visible = true
 	_popup.visible = true
 	_title.text = "Congratulations"
 	_sub.text = "You win!"
+	stars_shown = clampi(stars, 0, 3)
+	_stars.count = stars_shown
 	_stars.visible = true
 	_stars.queue_redraw()
+	_star_banner.visible = stars_shown >= 3
+	if stars_shown >= 3:
+		_star_banner.text = "3 STAR!"
 	# a tiny score line keeps the win screen honest without becoming a tally
 	var line := UITheme.label("SCORE %d  •  %.1fs" % [score, seconds], 12,
 		Color(0.8, 0.84, 0.9))
@@ -140,15 +185,23 @@ func show_game_over(score: int, bricks_left: int) -> void:
 	_popup.add_child(hint)
 
 
-## Three gold stars, drawn (no font glyph dependency).
+## Three stars, drawn (no font glyph dependency). `count` of them are FILLED
+## (caught); the rest are hollow — not yet collected, or lost for this level.
 class StarRow extends Control:
+	var count := 0
+	var radius := 17.0
+	var spacing := 46.0
+
 	func _draw() -> void:
 		var cx := size.x * 0.5
 		var cy := size.y * 0.5
 		for i in 3:
-			var offset := Vector2(cx + float(i - 1) * 46.0, cy)
-			_draw_star(offset, 17.0, Color(0.98, 0.82, 0.28))
-			_draw_star(offset, 17.0, Color(1, 0.94, 0.62), true)
+			var offset := Vector2(cx + float(i - 1) * spacing, cy)
+			if i < count:
+				_draw_star(offset, radius, Color(0.98, 0.82, 0.28))
+				_draw_star(offset, radius, Color(1, 0.94, 0.62), true)
+			else:
+				_draw_star(offset, radius, Color(0.55, 0.55, 0.60, 0.90), true)
 
 	func _draw_star(center: Vector2, radius: float, col: Color, outline := false) -> void:
 		var pts := PackedVector2Array()
@@ -161,3 +214,21 @@ class StarRow extends Control:
 			draw_polyline(pts, col, 1.5)
 		else:
 			draw_colored_polygon(pts, col)
+
+
+## --- machine-readable mirrors of what the HUD DRAWS (used by the suites; the
+## player sees the drawn star row and the COMBO label) ---------------------
+func star_display() -> String:
+	return "★".repeat(clampi(stars_shown, 0, 3)) + "☆".repeat(3 - clampi(stars_shown, 0, 3))
+
+
+func combo_text() -> String:
+	return _combo.text if _combo.visible else ""
+
+
+func win_banner_text() -> String:
+	return _star_banner.text if _star_banner.visible else ""
+
+
+func win_stars() -> int:
+	return _stars.count
