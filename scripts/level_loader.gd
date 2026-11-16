@@ -6,7 +6,12 @@ class_name BreakoutLevel extends RefCounted
 ## JSON : id, display name, topic, image file name, grid geometry (columns,
 ##        rows, cell pitch, screen origin), the CARVED CHANNEL (stem + fork +
 ##        two arms — every level must give the ball a path and a choice point),
-##        and the power-up tip cells.
+##        the power-up tip cells, and the optional UNBREAKABLE CELLS — a
+##        solid border ring listed explicitly as [col,row] pairs (never a
+##        magic colour). Unbreakable cells are walls, not bricks: the ball
+##        bounces off them, they are never broken, and they do not count
+##        toward the win. A listed cell the channel carved out (the stem gap)
+##        is an entry, not a wall, and is dropped at load.
 ##
 ## Stage B's level editor is meant to write EXACTLY these two files: a painted
 ## grid becomes the PNG, the geometry/channel block becomes the JSON. Nothing
@@ -25,7 +30,9 @@ const DEFAULT_ORIGIN := Vector2(30, 74)
 ##   {ok, err, id, name, topic, cols, rows, cell, origin, image,
 ##    grid: Array[Color] (index = row * cols + col, a == 0 -> empty),
 ##    powerup_cells: Array[Vector2i], channel_cells: Array[Vector2i],
-##    bricks: int}
+##    stem_cols: Array[int] (the two stem columns, for aiming the serve),
+##    unbreakable_cells: Array[Vector2i] (validated, still bricks),
+##    bricks: int (all solid cells), breakable: int, unbreakable: int}
 static func load_level(json_path: String) -> Dictionary:
 	if not FileAccess.file_exists(json_path):
 		return {"ok": false, "err": "level not found: %s" % json_path}
@@ -75,6 +82,14 @@ static func load_level(json_path: String) -> Dictionary:
 	var channel: Dictionary = d.get("channel", {})
 	var channel_cells: Array[Vector2i] = carve_channel(grid, cols, rows, channel)
 
+	# The stem columns, for the serve: the ball is aimed at the stem gap
+	# (the solid border leaves no other entry), so the game reads them from
+	# the level instead of assuming a centre channel. Same fallback as
+	# carve_channel (fork.x, fork.x + 1) when a level carries no spec.
+	var stem_cols := [cols / 2, cols / 2 + 1]
+	if channel.has("stem_cols") and channel["stem_cols"] is Array and (channel["stem_cols"] as Array).size() == 2:
+		stem_cols = [int(channel["stem_cols"][0]), int(channel["stem_cols"][1])]
+
 	# The power-up tips must be BRICKS at the end of each arm (the reference
 	# breaks a coloured cluster there first). The art can change under a level,
 	# so a tip that the carve turned into empty space snaps outward to the first
@@ -101,6 +116,18 @@ static func load_level(json_path: String) -> Dictionary:
 		if (cell_col as Color).a >= 0.5:
 			bricks += 1
 
+	# --- unbreakable cells: the solid border ring (walls, not bricks). They
+	# are listed explicitly in the JSON (never a magic colour) and are only
+	# kept when they are still bricks after the channel carve — a carved-out
+	# cell (the stem gap) is an entry, not a wall.
+	var unbreakable: Array[Vector2i] = []
+	for u in d.get("unbreakable_cells", []):
+		if not (u is Array) or (u as Array).size() != 2:
+			continue
+		var cellp := Vector2i(int(u[0]), int(u[1]))
+		if _is_brick(grid, cols, rows, cellp) and not unbreakable.has(cellp):
+			unbreakable.append(cellp)
+
 	var origin := DEFAULT_ORIGIN
 	if d.has("origin") and d["origin"] is Array and (d["origin"] as Array).size() == 2:
 		origin = Vector2(float(d["origin"][0]), float(d["origin"][1]))
@@ -117,7 +144,11 @@ static func load_level(json_path: String) -> Dictionary:
 		"grid": grid,
 		"powerup_cells": tips,
 		"channel_cells": channel_cells,
+		"stem_cols": stem_cols,
 		"bricks": bricks,
+		"unbreakable_cells": unbreakable,
+		"unbreakable": unbreakable.size(),
+		"breakable": bricks - unbreakable.size(),
 	}
 
 

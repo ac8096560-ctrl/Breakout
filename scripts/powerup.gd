@@ -1,6 +1,8 @@
 class_name PowerUp extends Node2D
 ## A falling power-up. Stage A ships the "+3" multi-ball in two colours (blue
 ## and green — the reference shows no behavioural difference between them).
+## The gold "x3" triples the balls in play (up to MAX_BALLS); it falls and is
+## caught exactly like "+3".
 ##
 ## It falls STRAIGHT DOWN, must be caught by the paddle, and is simply lost if
 ## it exits the bottom of the screen. Collection is decided by the scene
@@ -47,4 +49,7 @@ func _draw() -> void:
 	draw_arc(Vector2.ZERO, RADIUS - 1.0, 0.0, TAU, 24, Color(1, 1, 1, 0.55), 1.5)
 	if kind == "plus3":
 		draw_string(font, Vector2(-8, 4), "+3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
+			Color(1, 1, 1, 0.96))
+	elif kind == "times3":
+		draw_string(font, Vector2(-8, 4), "x3", HORIZONTAL_ALIGNMENT_CENTER, 16, 10,
 			Color(1, 1, 1, 0.96))

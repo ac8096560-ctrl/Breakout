@@ -27,6 +27,14 @@ const VIEW := Vector2(540, 960)
 ## of the reference reachable.
 const PADDLE_Y := 760.0
 const BALL_SPEED := 420.0
+## Serve angle, degrees from straight up. The solid border leaves only the
+## 2-cell stem gap (24 px wide, 16 px for the ball centre) as the entry, and
+## a wide serve settles into a bounce loop below the border instead of ever
+## threading it — the reference ball goes straight up the stem. ±2 deg drifts
+## ~3 px over the trip to the gap, so the serve threads it cleanly on the
+## first trip while keeping a touch of variety per seed. (±5 deg would drift
+## ~7.5 px and nearly clip the border.)
+const SERVE_ANGLE_DEG := 2.0
 const START_LIVES := 3
 const READY_SECONDS := 1.2
 const LOST_SECONDS := 0.7
@@ -39,6 +47,9 @@ const MAX_POWERUPS := 40
 ## a take (whichever brick that turns out to be — the outcome still comes from
 ## play, nothing is scripted).
 const POWERUP_CHANCE := 0.20
+## 30% of power-up drops are the gold "x3" (triples the balls in play); the
+## rest are the blue/green "+3" (adds 3 balls).
+const TIMES3_CHANCE := 0.30
 const FIRST_DROP_BRICKS := 30
 ## Nothing falls during the opening beat, so the take starts on ONE ball like
 ## the reference (whose first multi-ball lands around t=8s) instead of flooding
@@ -89,6 +100,7 @@ var _bodies: Dictionary = {}       # Vector2i -> Brick
 var _balls: Array = []
 var _powerups: Array = []
 var _tip_cells: Array = []
+var _unbreakable_cells: Array = []  # Vector2i border cells: walls, not bricks
 var _ready_left := READY_SECONDS
 var _lost_left := 0.0
 var _player_target := -1.0
@@ -199,10 +211,14 @@ func _load_level() -> void:
 	cell = float(level["cell"])
 	origin = level["origin"]
 	grid = level["grid"]
-	bricks_total = int(level["bricks"])
+	# The win counts BREAKABLE bricks only: the solid border is a wall, and
+	# counting it would make a level unwinnable (it can never be broken).
+	bricks_total = int(level["breakable"])
 	bricks_left = bricks_total
 	for t in level["powerup_cells"]:
 		_tip_cells.append(t)
+	for u in level["unbreakable_cells"]:
+		_unbreakable_cells.append(u)
 	field.configure(cols, rows, cell, origin, pal, grid)
 	field.queue_redraw()
 	_spawn_brick_bodies()
@@ -218,6 +234,7 @@ func _spawn_brick_bodies() -> void:
 			b.name = "Brick_%d_%d" % [c, r]
 			bricks_root.add_child(b)
 			b.setup(Vector2i(c, r), cell_center(Vector2i(c, r)))
+			b.unbreakable = _unbreakable_cells.has(Vector2i(c, r))
 			_bodies[Vector2i(c, r)] = b
 
 
@@ -226,6 +243,17 @@ func cell_center(c: Vector2i) -> Vector2:
 
 
 # ------------------------------------------------------------------ flow
+## Game x of the channel stem centre, read from the level's stem_cols so the
+## serve aims at the entry gap on every level (level_01 and level_02 both use
+## stem_cols [19,20] -> x=270, but nothing here hardcodes that). Falls back
+## to the view centre when a level carries no stem data.
+func _stem_centre_x() -> float:
+	var sc: Array = level.get("stem_cols", [])
+	if sc.size() == 2:
+		return origin.x + (float(sc[0]) + float(sc[1]) + 1.0) * cell * 0.5
+	return VIEW.x * 0.5
+
+
 func _enter_ready() -> void:
 	state = STATE_READY
 	_ready_left = READY_SECONDS
@@ -237,7 +265,11 @@ func _enter_ready() -> void:
 func _start_play() -> void:
 	state = STATE_PLAYING
 	if _held_ball != null and is_instance_valid(_held_ball):
-		var ang := deg_to_rad(rng.randf_range(-38.0, 38.0))
+		# Aim the serve at the channel stem: the border is solid, so the
+		# stem gap is the only way in. The paddle is centred on the stem
+		# first (a no-op in auto-play, where it already sits there).
+		paddle.move_to_x(_stem_centre_x())
+		var ang := deg_to_rad(rng.randf_range(-SERVE_ANGLE_DEG, SERVE_ANGLE_DEG))
 		_held_ball.position = paddle.position + Vector2(0, -22.0)
 		_held_ball.launch(Vector2(sin(ang), -cos(ang)) * (BALL_SPEED + rng.randf_range(-12.0, 12.0)))
 	_held_ball = null
@@ -266,8 +298,11 @@ func _physics_process(delta: float) -> void:
 
 func _serve_again() -> void:
 	state = STATE_PLAYING
+	# Re-centre on the stem for the same reason as _start_play: a re-serve
+	# from wherever the paddle happened to be can never find the gap.
+	paddle.move_to_x(_stem_centre_x())
 	var b := _new_ball(paddle.position + Vector2(0, -22.0))
-	var ang := deg_to_rad(rng.randf_range(-38.0, 38.0))
+	var ang := deg_to_rad(rng.randf_range(-SERVE_ANGLE_DEG, SERVE_ANGLE_DEG))
 	b.launch(Vector2(sin(ang), -cos(ang)) * BALL_SPEED)
 	state_changed.emit(state)
 
@@ -436,7 +471,13 @@ func _on_ball_hit(collider: Node, _normal: Vector2, b: Ball) -> void:
 	if collider is Brick:
 		var brick := collider as Brick
 		if brick.live:
-			break_cell(brick.cell)
+			if brick.unbreakable:
+				# A solid border brick: the ball already bounced off it in
+				# physics — it is a wall, not a brick. No break, no score,
+				# no power-up, no count change.
+				AudioManager.play("bounce", -8.0)
+			else:
+				break_cell(brick.cell)
 	elif collider is Paddle:
 		b.vel = paddle.bounce_for(b.position.x, b.speed())
 		AudioManager.play("bounce")
@@ -462,6 +503,8 @@ func break_cell(c: Vector2i, silent := false) -> void:
 	if not _bodies.has(c):
 		return
 	var brick: Brick = _bodies[c]
+	if brick.unbreakable:
+		return
 	_bodies.erase(c)
 	brick.live = false
 	brick.queue_free()
@@ -496,9 +539,13 @@ func _drop_powerup(at: Vector2) -> void:
 	if _powerups.size() >= MAX_POWERUPS:
 		return
 	var p := PowerUp.new()
-	p.kind = "plus3"
-	p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
-		else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
+	if rng.randf() < TIMES3_CHANCE:
+		p.kind = "times3"
+		p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
+	else:
+		p.kind = "plus3"
+		p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
+			else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
 	p.position = Vector2(clampf(at.x, PowerUp.RADIUS, VIEW.x - PowerUp.RADIUS), at.y)
 	powerups_root.add_child(p)
 	_powerups.append(p)
@@ -521,6 +568,13 @@ func _tick_powerups(_delta: float) -> void:
 			_collect_powerup(up)
 
 
+func _multiply_balls(mult: int, at: Vector2) -> void:
+	var target := mini(_balls.size() * mult, MAX_BALLS)
+	var to_add := target - _balls.size()
+	if to_add > 0:
+		_add_balls(to_add, at)
+
+
 func _collect_powerup(up: PowerUp) -> void:
 	up.alive = false
 	_powerups.erase(up)
@@ -531,7 +585,10 @@ func _collect_powerup(up: PowerUp) -> void:
 	FX.ring(fx_root, at, pal.get("powerup_blue", Color(0.22, 0.48, 0.92)), 26.0, 0.40)
 	if first_multiball_at < 0.0:
 		first_multiball_at = elapsed
-	_add_balls(3, at)
+	if up.kind == "times3":
+		_multiply_balls(3, at)
+	else:
+		_add_balls(3, at)
 	paddle.show_buff(BUFF_SECONDS)
 
 
@@ -562,6 +619,10 @@ func paddle_x() -> float:
 
 func live_bricks() -> int:
 	return _bodies.size()
+
+
+func is_unbreakable(c: Vector2i) -> bool:
+	return _unbreakable_cells.has(c)
 
 
 # --- deterministic hooks used by --breakout-test (never by gameplay) --------
@@ -595,9 +656,11 @@ func debug_clear_balls() -> void:
 	_balls.clear()
 
 
-func debug_spawn_powerup_at_paddle() -> PowerUp:
+func debug_spawn_powerup_at_paddle(kind: String = "plus3") -> PowerUp:
 	var p := PowerUp.new()
-	p.kind = "plus3"
+	p.kind = kind
+	if kind == "times3":
+		p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
 	p.position = paddle.position + Vector2(0, -10)
 	powerups_root.add_child(p)
 	_powerups.append(p)
@@ -608,4 +671,7 @@ func debug_spawn_powerup_at_paddle() -> PowerUp:
 func debug_clear_all_bricks() -> void:
 	var cells := _bodies.keys()
 	for c in cells:
+		var b: Brick = _bodies[c]
+		if b.unbreakable:
+			continue
 		break_cell(c, true)

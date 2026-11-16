@@ -65,6 +65,7 @@ func _suite_all() -> void:
 	await _check_paddle_catch(g)
 	await _check_player_input(g)
 	await _check_multiball(g)
+	await _check_multiball_times3(g)
 	await _check_win(g)
 	g.queue_free()
 	await get_tree().process_frame
@@ -75,31 +76,54 @@ func _suite_all() -> void:
 	g2.queue_free()
 	await get_tree().process_frame
 
+	# The solid border exists only on level_02, so it gets its own instance.
+	Game.level_id = "level_02_jensen"
+	var g3: Node = await _new_game()
+	g3.debug_force_play()
+	await _check_unbreakable_border(g3)
+	g3.queue_free()
+	await get_tree().process_frame
+
 	await _report("WR_BREAKOUT_RESULT", _fails == 0, "failing suites: %d" % _fails)
 
 
 func _check_level_load() -> void:
-	var lv := BreakoutLevel.load_level(LEVEL_JSON)
-	var ok := bool(lv.get("ok", false))
-	var detail := str(lv.get("err", ""))
-	if ok:
-		var colours := {}
-		var grid: Array = lv["grid"]
-		var channel_empty := true
-		for c in lv["channel_cells"]:
-			var cellc: Vector2i = c
-			if (grid[cellc.y * int(lv["cols"]) + cellc.x] as Color).a >= 0.5:
-				channel_empty = false
-		for col in grid:
-			var cc: Color = col
-			if cc.a >= 0.5:
-				colours[cc.to_html(false)] = true
-		ok = int(lv["bricks"]) > 900 and int(lv["channel_cells"].size()) > 20 \
-			and int(lv["powerup_cells"].size()) == 2 and colours.size() >= 4 and channel_empty
-		detail = "bricks=%d channel=%d colours=%d tips=%d" % [
-			int(lv["bricks"]), int(lv["channel_cells"].size()), colours.size(),
-			int(lv["powerup_cells"].size())]
-	_suite("level_load", ok, detail)
+	# Every registered level must load and satisfy the design rules (enough
+	# bricks, a carved channel, two power-up tips, a real palette, and an
+	# empty channel). Adding a level to Game.LEVELS automatically tests it.
+	var all_ok := true
+	var details: Array[String] = []
+	for level_id in Game.LEVELS:
+		var lv := BreakoutLevel.load_level("res://data/levels/%s.json" % level_id)
+		var ok := bool(lv.get("ok", false))
+		var detail := str(lv.get("err", ""))
+		if ok:
+			var colours := {}
+			var grid: Array = lv["grid"]
+			var channel_empty := true
+			for c in lv["channel_cells"]:
+				var cellc: Vector2i = c
+				if (grid[cellc.y * int(lv["cols"]) + cellc.x] as Color).a >= 0.5:
+					channel_empty = false
+			for col in grid:
+				var cc: Color = col
+				if cc.a >= 0.5:
+					colours[cc.to_html(false)] = true
+			ok = int(lv["bricks"]) > 900 and int(lv["channel_cells"].size()) > 20 \
+				and int(lv["powerup_cells"].size()) == 2 and colours.size() >= 4 and channel_empty \
+				and int(lv["breakable"]) + int(lv["unbreakable"]) == int(lv["bricks"]) \
+				and int(lv["breakable"]) > 900
+			# level_02's solid border is 174 unbreakable cells, 1724 breakable
+			if level_id == "level_02_jensen":
+				ok = ok and int(lv["unbreakable"]) == 174 and int(lv["breakable"]) == 1724
+			detail = "%s bricks=%d breakable=%d unbreakable=%d channel=%d colours=%d tips=%d" % [
+				level_id, int(lv["bricks"]), int(lv["breakable"]), int(lv["unbreakable"]),
+				int(lv["channel_cells"].size()), colours.size(),
+				int(lv["powerup_cells"].size())]
+		if not ok:
+			all_ok = false
+		details.append(detail)
+	_suite("level_load", all_ok, " | ".join(details))
 
 
 func _check_ball_bounce(g: Node) -> void:
@@ -126,6 +150,9 @@ func _check_brick_break(g: Node) -> void:
 	for c in g._bodies.keys():
 		var cellc: Vector2i = c
 		if cellc.y < 12 and cellc.x > 2 and cellc.x < 37:
+			var b0: Brick = g._bodies[c]
+			if b0.unbreakable:
+				continue
 			target = cellc
 			break
 	if target.x < 0:
@@ -197,6 +224,55 @@ func _check_multiball(g: Node) -> void:
 		and int(g.powerups_caught) >= 1
 	_suite("multiball_plus3", ok, "balls %d -> %d caught=%d first=%.2fs" % [
 		before, after, int(g.powerups_caught), float(g.first_multiball_at)])
+
+
+func _check_multiball_times3(g: Node) -> void:
+	g.debug_ensure_playing()
+	if int(g.ball_count()) == 0:
+		g.debug_spawn_ball(Vector2(270, 500), Vector2(0, -300))
+	await get_tree().physics_frame
+	var before := int(g.ball_count())
+	var caught_before := int(g.powerups_caught)
+	g.debug_spawn_powerup_at_paddle("times3")
+	for i in 8:
+		await get_tree().physics_frame
+	var after := int(g.ball_count())
+	# 120 mirrors BreakoutGame.MAX_BALLS (the test harness cannot see it).
+	var want := mini(before * 3, 120)
+	var ok := after == want and int(g.powerups_caught) == caught_before + 1
+	_suite("multiball_times3", ok, "balls %d -> %d (want %d) caught=%d" % [
+		before, after, want, int(g.powerups_caught)])
+
+
+func _check_unbreakable_border(g: Node) -> void:
+	# The solid border (level_02's grey ring) is a wall: a ball hitting it
+	# bounces off and breaks nothing — no brick removed, no score, no count.
+	var cell := Vector2i(10, 49)
+	var before := int(g.bricks_left)
+	var score_before := int(g.score)
+	var is_wall := bool(g.is_unbreakable(cell))
+	g.debug_clear_balls()
+	var at: Vector2 = g.cell_center(cell) + Vector2(0, 16)
+	var b: Ball = g.debug_spawn_ball(at, Vector2(0, -350))
+	var bounced := false
+	for i in 20:
+		await get_tree().physics_frame
+		if not is_instance_valid(b) or not b.active:
+			break
+		if b.vel.y > 0.0:
+			bounced = true
+			break
+	var still_there: bool = g._bodies.has(cell) and bool((g._bodies[cell] as Brick).live)
+	var ok: bool = is_wall and bounced and still_there \
+		and int(g.bricks_left) == before and int(g.score) == score_before
+	_suite("unbreakable_border", ok, "cell=%s wall=%s bounced=%s still_live=%s bricks=%d->%d score=%d->%d" % [
+		str(cell), str(is_wall), str(bounced), str(still_there),
+		before, int(g.bricks_left), score_before, int(g.score)])
+	if is_instance_valid(b):
+		b.active = false
+		b.queue_free()
+	g.debug_clear_balls()
+	g.debug_ensure_playing()
 
 
 func _check_win(g: Node) -> void:
@@ -278,6 +354,15 @@ func _suite_pace() -> void:
 func _suite_record() -> void:
 	Game.auto_play = true
 	Game.menu_seed_idx = 0                    # seed 1
+	# Optional level selection: --breakout-record level=level_02_jensen
+	# (default: the menu's current level, index 0). Lets a take be recorded
+	# for any registered level without touching the menu.
+	for a in _args:
+		if str(a).begins_with("level="):
+			var want := str(a).trim_prefix("level=")
+			var idx := Game.LEVELS.find(want)
+			if idx >= 0:
+				Game.menu_level_idx = idx
 	Game.start_game(1)
 	var game: Node = null
 	for i in 120:

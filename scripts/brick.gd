@@ -5,11 +5,14 @@ class_name Brick extends StaticBody2D
 ##
 ## The scene owns the reaction: this node only carries its cell coordinate and
 ## a `live` flag; BreakoutGame.break_cell() removes it and updates the state.
+## `unbreakable` marks a solid border brick (a wall, not a brick): the ball
+## bounces off it in physics and the scene never breaks it.
 
 const SIZE := 10.0
 
 var cell := Vector2i.ZERO
 var live := true
+var unbreakable := false
 
 
 func setup(c: Vector2i, world_position: Vector2) -> void:
