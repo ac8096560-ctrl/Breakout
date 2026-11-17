@@ -160,13 +160,32 @@ static func load_level(json_path: String) -> Dictionary:
 
 
 ## Decode a PNG from ANY readable path — res:// inside an exported APK, an
-## absolute path, or user:// where the editor writes. FileAccess is the only
-## reader that works for res:// in a packaged Android build, so no caller may
-## fall back to Image.load_from_file(ProjectSettings.globalize_path(...)).
-## Returns null when the file cannot be read or cannot be decoded. PNG is the
-## level format; JPEG is accepted because the editor's IMPORT can take any
-## portrait art (the editor re-saves it as a PNG).
+## absolute path, or user:// where the editor writes. Returns null when the
+## file cannot be read or cannot be decoded. PNG is the level format; JPEG is
+## accepted because the editor's IMPORT can take any portrait art (the editor
+## re-saves it as a PNG).
+##
+## Two readers, because the two locations are different things:
+## - res:// (shipped levels): the raw .png is NOT exported into the APK — the
+##   exporter packs only the imported texture (.ctex) plus the .import remap.
+##   So a shipped level MUST be read through ResourceLoader, which follows the
+##   remap to the .ctex that IS in the APK. The level PNGs are imported with
+##   vram_texture=false, so get_image() returns the exact pixel values (one
+##   pixel = one brick, colours intact). FileAccess CANNOT read a res:// .png
+##   in a packaged build — the file is not there.
+## - user:// / absolute paths (editor-saved levels, user-picked import files):
+##   real files on disk, so FileAccess + a buffer decode is the right reader.
+## No caller may use Image.load_from_file(ProjectSettings.globalize_path(...)):
+## globalize_path returns a path that is not a real file inside an APK.
 static func load_png_image(path: String) -> Image:
+	if path.begins_with("res://"):
+		var tex := load(path) as Texture2D
+		if tex == null:
+			return null
+		var img := tex.get_image()
+		if img == null:
+			return null
+		return img
 	if not FileAccess.file_exists(path):
 		return null
 	var bytes := FileAccess.get_file_as_bytes(path)
