@@ -151,19 +151,22 @@ func _build_ui() -> void:
 	size_row.size = Vector2(520, 28)
 	size_row.add_theme_constant_override("separation", 4)
 	add_child(size_row)
-	var b40 := UITheme.button("40x50", 11, Color(0.35, 0.6, 0.85), Vector2(96, 26))
+	var b40 := UITheme.button("40x50", 11, Color(0.35, 0.6, 0.85), Vector2(74, 26))
 	b40.pressed.connect(func() -> void: new_level(40, 50))
 	size_row.add_child(b40)
-	var b20 := UITheme.button("20x26", 11, Color(0.35, 0.6, 0.85), Vector2(96, 26))
+	var b20 := UITheme.button("20x26", 11, Color(0.35, 0.6, 0.85), Vector2(74, 26))
 	b20.pressed.connect(func() -> void: new_level(20, 26))
 	size_row.add_child(b20)
-	var bclear := UITheme.button("CLEAR", 11, Color(0.6, 0.4, 0.4), Vector2(96, 26))
+	var b80 := UITheme.button("80x100", 11, Color(0.35, 0.6, 0.85), Vector2(74, 26))
+	b80.pressed.connect(func() -> void: new_level(80, 100))
+	size_row.add_child(b80)
+	var bclear := UITheme.button("CLEAR", 11, Color(0.6, 0.4, 0.4), Vector2(74, 26))
 	bclear.pressed.connect(func() -> void: _clear_art())
 	size_row.add_child(bclear)
-	var bopen := UITheme.button("LOAD NEXT", 11, Color(0.4, 0.55, 0.7), Vector2(120, 26))
+	var bopen := UITheme.button("LOAD NEXT", 11, Color(0.4, 0.55, 0.7), Vector2(104, 26))
 	bopen.pressed.connect(_cycle_level)
 	size_row.add_child(bopen)
-	var bov := UITheme.button("OVERWRITE: OFF", 10, Color(0.7, 0.5, 0.35), Vector2(100, 26))
+	var bov := UITheme.button("OVERWRITE: OFF", 10, Color(0.7, 0.5, 0.35), Vector2(96, 26))
 	bov.pressed.connect(func() -> void:
 		allow_overwrite = not allow_overwrite
 		bov.text = "OVERWRITE: %s" % ("ON" if allow_overwrite else "OFF"))
@@ -174,16 +177,22 @@ func _build_ui() -> void:
 	action_row.size = Vector2(520, 36)
 	action_row.add_theme_constant_override("separation", 4)
 	add_child(action_row)
-	var bsave := UITheme.button("SAVE", 13, Color(0.3, 0.75, 0.45), Vector2(124, 34))
+	var bsave := UITheme.button("SAVE", 13, Color(0.3, 0.75, 0.45), Vector2(100, 34))
 	bsave.pressed.connect(func() -> void: save_to(""))
 	action_row.add_child(bsave)
-	var bload := UITheme.button("LOAD", 13, Color(0.35, 0.6, 0.9), Vector2(124, 34))
+	var bload := UITheme.button("LOAD", 13, Color(0.35, 0.6, 0.9), Vector2(100, 34))
 	bload.pressed.connect(func() -> void: load_level_id(_next_load_id()))
 	action_row.add_child(bload)
-	var bplay := UITheme.button("PLAY", 13, Color(0.92, 0.35, 0.35), Vector2(124, 34))
+	# IMPORT ANY ART: pick an image, it is stretched onto the CURRENT grid (the
+	# counts line shows that grid) and becomes the painted art. Any size, any
+	# aspect — SAVE then writes the normal PNG + JSON pair.
+	var bimport := UITheme.button("IMPORT", 12, Color(0.78, 0.45, 0.95), Vector2(100, 34))
+	bimport.pressed.connect(_open_import_dialog)
+	action_row.add_child(bimport)
+	var bplay := UITheme.button("PLAY", 13, Color(0.92, 0.35, 0.35), Vector2(100, 34))
 	bplay.pressed.connect(func() -> void: play())
 	action_row.add_child(bplay)
-	var bmenu := UITheme.button("MENU", 13, Color(0.45, 0.45, 0.5), Vector2(124, 34))
+	var bmenu := UITheme.button("MENU", 13, Color(0.45, 0.45, 0.5), Vector2(100, 34))
 	bmenu.pressed.connect(func() -> void: Game.goto_menu())
 	action_row.add_child(bmenu)
 
@@ -479,11 +488,15 @@ func load_level_id(id: String) -> bool:
 	topic = str(d.get("topic", "EDITOR LEVEL"))
 	# The PNG is already carved; re-carving the same spec is idempotent, so the
 	# art loads as the level's bricks and the channel spec comes from the JSON.
-	var img := Image.load_from_file(ProjectSettings.globalize_path(str(lv["image"])))
+	# Same reader as the game (FileAccess + buffer decode): on Android a res://
+	# PNG lives inside the APK and globalize_path + load_from_file returns null.
+	var img := BreakoutLevel.load_png_image(str(lv["image"]))
 	if img == null:
 		_refresh("cannot decode %s" % str(lv["image"]))
 		AudioManager.play("error")
 		return false
+	if img.get_width() != cols or img.get_height() != rows:
+		img.resize(cols, rows, Image.INTERPOLATE_NEAREST)
 	img.convert(Image.FORMAT_RGBA8)
 	_art = []
 	_art.resize(cols * rows)
@@ -509,6 +522,100 @@ func load_level_id(id: String) -> bool:
 	_refresh("loaded %s  •  %d bricks / %d breakable / %d unbreakable" % [
 		id, int(cnt["bricks"]), int(cnt["breakable"]), int(cnt["unbreakable"])])
 	return true
+
+
+# ------------------------------------------------------------------ import
+## IMPORT ANY ART. `path` is any image file the picker can reach (Android's
+## filesystem, res://, user://); the image does NOT have to be the grid's pixel
+## size — it is STRETCHED onto exactly cols x rows, so any portrait art becomes
+## a playable level. The current grid size is used unless target_cols/rows are
+## given; the channel, tips and border follow the normal editor rules, and
+## SAVE writes the standard PNG + JSON pair (no second format).
+## Returns {ok, err, cols, rows, source_w, source_h, bricks}.
+func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
+	var img := BreakoutLevel.load_png_image(path)
+	if img == null:
+		_refresh("IMPORT FAILED — cannot decode %s" % path)
+		AudioManager.play("error")
+		return {"ok": false, "err": "cannot decode %s" % path}
+	var src_w := img.get_width()
+	var src_h := img.get_height()
+	if src_w <= 0 or src_h <= 0:
+		_refresh("IMPORT FAILED — %s has no pixels" % path)
+		AudioManager.play("error")
+		return {"ok": false, "err": "empty image"}
+	var tc := clampi(target_cols if target_cols > 0 else cols, 4, 128)
+	var tr := clampi(target_rows if target_rows > 0 else rows, 4, 128)
+	img.convert(Image.FORMAT_RGBA8)
+	if src_w != tc or src_h != tr:
+		# Stretch to fill the grid. Shrinking a photo needs a real filter;
+		# growing pixel art must stay crisp, so nearest wins upwards.
+		var shrinking := tc * tr < src_w * src_h
+		img.resize(tc, tr, Image.INTERPOLATE_LANCZOS if shrinking else Image.INTERPOLATE_NEAREST)
+	# Adopt the new grid. `cell` only shrinks when the grid needs it (80x100 ->
+	# cell 6, exactly like the shipped Ronaldo level), so the field stays in
+	# the same 480x600 area and the portrait layout never changes.
+	cols = tc
+	rows = tr
+	cell = minf(DEFAULT_CELL, minf(480.0 / float(cols), 600.0 / float(rows)))
+	origin = Vector2(round((VIEW.x - cols * cell) * 0.5), FIELD_TOP)
+	_art = []
+	_art.resize(cols * rows)
+	var filled := 0
+	for r in rows:
+		for c in cols:
+			var px := img.get_pixel(c, r)
+			if px.a >= 0.5:
+				_art[r * cols + c] = Color(px.r, px.g, px.b, 1.0)
+				filled += 1
+			else:
+				_art[r * cols + c] = Color(0, 0, 0, 0)
+	# The channel is geometry, not art: keep a valid existing one, otherwise
+	# carve the default Y so the imported level has its two paths immediately.
+	var keep := not _channel.is_empty()
+	if keep:
+		var fork := _fork_cell()
+		keep = fork.x > 0 and fork.y > 0 and fork.x < cols and fork.y < rows
+	if not keep:
+		carve_at(Vector2i(cols / 2, int(round(rows * 0.68))))
+	_tips = []
+	_derive_tips()
+	_border_solid = true
+	_build_palette()
+	_sync_fields()
+	_dirty = true
+	var cnt := counts()
+	AudioManager.play("confirm")
+	_refresh("imported %s  •  %dx%d art stretched to %dx%d  •  %d bricks / %d breakable" % [
+		path.get_file(), src_w, src_h, cols, rows, int(cnt["bricks"]), int(cnt["breakable"])])
+	return {"ok": true, "err": "", "cols": cols, "rows": rows,
+		"source_w": src_w, "source_h": src_h, "bricks": int(cnt["bricks"])}
+
+
+func _fork_cell() -> Vector2i:
+	if _channel.get("fork") is Array and (_channel["fork"] as Array).size() == 2:
+		return Vector2i(int(_channel["fork"][0]), int(_channel["fork"][1]))
+	return Vector2i(-1, -1)
+
+
+## The picker: any image on the device. Importing never needs an import step
+## from Godot (the PNG is read with FileAccess), so a file from Downloads works.
+func _open_import_dialog() -> void:
+	var dlg := FileDialog.new()
+	dlg.title = "IMPORT ANY PORTRAIT ART (%dx%d grid)" % [cols, rows]
+	dlg.access = FileDialog.ACCESS_FILESYSTEM
+	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	dlg.filters = PackedStringArray(["*.png, *.jpg, *.jpeg ; Images"])
+	dlg.use_native_dialog = false
+	dlg.size = Vector2i(520, 620)
+	dlg.position = Vector2i(10, 200)
+	dlg.file_selected.connect(func(path: String) -> void:
+	#import_art(path)
+		dlg.queue_free())
+	dlg.canceled.connect(func() -> void: dlg.queue_free())
+	add_child(dlg)
+	dlg.popup_centered()
+	_refresh("pick an image — it will be stretched to the %dx%d grid" % [cols, rows])
 
 
 func _next_load_id() -> String:

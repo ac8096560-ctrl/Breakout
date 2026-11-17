@@ -14,6 +14,7 @@ var _bricks: Label
 var _level: Label
 var _mult: Label
 var _combo: Label
+var _nukes: Label
 var _stars_hud: StarRow
 var _dim: ColorRect
 var _popup: Panel
@@ -45,6 +46,13 @@ func _build_top() -> void:
 	_bricks.position = Vector2(10, 25)
 	_bricks.size = Vector2(200, 16)
 	add_child(_bricks)
+
+	# Brief 22 — the NUKE counter (its own hot-pink so it matches the drop).
+	_nukes = UITheme.label("", 11, Color(1.0, 0.45, 0.82), 3, Color(0, 0, 0, 0.85))
+	_nukes.position = Vector2(10, 43)
+	_nukes.size = Vector2(200, 16)
+	_nukes.visible = false
+	add_child(_nukes)
 
 	_lives = UITheme.label("LIVES 3", 13, Color(0.96, 0.72, 0.70), 3, Color(0, 0, 0, 0.85))
 	_lives.position = Vector2(380, 6)
@@ -135,6 +143,10 @@ func _process(_delta: float) -> void:
 	_lives.text = "LIVES %d" % int(game.lives)
 	_bricks.text = "BRICKS %d" % int(game.bricks_left)
 	_level.text = "%s  •  SEED %d" % [str(game.level.get("name", "")), int(game.seed_value)]
+	var nukes := int(game.nukes_caught)
+	_nukes.visible = nukes > 0
+	if nukes > 0:
+		_nukes.text = "NUKE x%d  (%d BRICKS)" % [nukes, int(game.nuke_bricks)]
 	var mult := int(game.score_mult)
 	_mult.visible = mult > 1
 	if mult > 1:

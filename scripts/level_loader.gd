@@ -59,14 +59,21 @@ static func load_level(json_path: String) -> Dictionary:
 	if not FileAccess.file_exists(img_path):
 		return {"ok": false, "err": "portrait png not found: %s" % img_path}
 
-	# Read the PNG straight off disk: no import step, so a test (or a level the
-	# editor just wrote) can be loaded in the same run it was created.
-	var img := Image.load_from_file(ProjectSettings.globalize_path(img_path))
+	# Read the PNG bytes through FileAccess (NOT Image.load_from_file +
+	# globalize_path): on Android every res:// file is packed INSIDE the APK, so
+	# globalize_path returns a path that is not a real file and load_from_file
+	# returns null — every shipped level failed with "cannot decode png" in the
+	# APK. FileAccess reads res:// from inside the APK and user:// straight off
+	# disk, so this is the one path for both, and it still needs no import step:
+	# a level the editor just wrote loads in the same run it was created.
+	var img := load_png_image(img_path)
 	if img == null:
 		return {"ok": false, "err": "cannot decode png: %s" % img_path}
+	# A PNG that is not exactly cols x rows is stretched onto the level's grid
+	# instead of being rejected: hand-made or older art still loads and plays.
+	# The editor's import writes an exact-size PNG, so this is the safety net.
 	if img.get_width() != cols or img.get_height() != rows:
-		return {"ok": false, "err": "portrait is %dx%d but the level says %dx%d" % [
-			img.get_width(), img.get_height(), cols, rows]}
+		img.resize(cols, rows, Image.INTERPOLATE_NEAREST)
 	img.convert(Image.FORMAT_RGBA8)
 
 	var grid: Array = []
@@ -150,6 +157,35 @@ static func load_level(json_path: String) -> Dictionary:
 		"unbreakable": unbreakable.size(),
 		"breakable": bricks - unbreakable.size(),
 	}
+
+
+## Decode a PNG from ANY readable path — res:// inside an exported APK, an
+## absolute path, or user:// where the editor writes. FileAccess is the only
+## reader that works for res:// in a packaged Android build, so no caller may
+## fall back to Image.load_from_file(ProjectSettings.globalize_path(...)).
+## Returns null when the file cannot be read or cannot be decoded. PNG is the
+## level format; JPEG is accepted because the editor's IMPORT can take any
+## portrait art (the editor re-saves it as a PNG).
+static func load_png_image(path: String) -> Image:
+	if not FileAccess.file_exists(path):
+		return null
+	var bytes := FileAccess.get_file_as_bytes(path)
+	if bytes.is_empty():
+		return null
+	var img := Image.new()
+	var lower := path.to_lower()
+	var err: int
+	if lower.ends_with(".jpg") or lower.ends_with(".jpeg"):
+		err = img.load_jpg_from_buffer(bytes)
+	else:
+		err = img.load_png_from_buffer(bytes)
+	if err != OK:
+		# A jpg saved with a .png name (or the reverse): try the other decoder
+		# once instead of refusing art the user clearly picked.
+		err = img.load_jpg_from_buffer(bytes) if lower.ends_with(".png") else img.load_png_from_buffer(bytes)
+		if err != OK:
+			return null
+	return img
 
 
 ## Carve the Y channel into `grid` in place and return the carved cells.

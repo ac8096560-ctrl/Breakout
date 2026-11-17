@@ -62,6 +62,7 @@ func _new_game() -> Node:
 # ------------------------------------------------------------------ suites
 func _suite_all() -> void:
 	await _check_level_load()
+	await _check_apk_loader()
 
 	var g: Node = await _new_game()
 	g.debug_force_play()
@@ -74,6 +75,7 @@ func _suite_all() -> void:
 	await _check_powerup_minus(g)
 	await _check_powerup_star(g)
 	await _check_drop_pool(g)
+	await _check_nuke(g)
 	await _check_win(g)
 	g.queue_free()
 	await get_tree().process_frame
@@ -162,6 +164,58 @@ func _check_level_load() -> void:
 			all_ok = false
 		details.append(detail)
 	_suite("level_load", all_ok, " | ".join(details))
+
+
+# ---------------------------------------------------------------- Brief 22
+## Task 1 — THE APK LOADER PATH. On Android every res:// file is packed INSIDE
+## the APK, so ProjectSettings.globalize_path() + Image.load_from_file() returns
+## null and every level failed to load (ok:false, "cannot decode png") in the
+## built APK. This check goes through the bytes path the game now uses for the
+## four shipped levels and prints ok + bricks/breakable for each, plus a PNG
+## that is NOT the level's pixel size (it must be scaled, never rejected).
+func _check_apk_loader() -> void:
+	var all_ok := true
+	var details: Array[String] = []
+	for level_id in Game.LEVELS:
+		var json_path := BreakoutLevelWriter.find_json(level_id)
+		var lv := BreakoutLevel.load_level(json_path)
+		var ok := json_path != "" and bool(lv.get("ok", false))
+		var img: Image = null
+		if ok:
+			img = BreakoutLevel.load_png_image(str(lv["image"]))
+			ok = img != null and img.get_width() == int(lv["cols"]) \
+				and img.get_height() == int(lv["rows"])
+			ok = ok and int(lv["bricks"]) > 900 and int(lv["breakable"]) > 0
+		details.append("%s ok=%s bricks=%d breakable=%d" % [
+			level_id, str(ok), int(lv.get("bricks", 0)), int(lv.get("breakable", 0))])
+		if not ok:
+			all_ok = false
+	# A hand-made PNG whose pixel size does not match the level grid: the
+	# loader must STRETCH it onto the grid instead of failing, which is what
+	# keeps old/imported art playable (Task 2).
+	var probe_dir := "user://breakout_apk_probe"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(probe_dir))
+	var small := Image.create(10, 12, false, Image.FORMAT_RGBA8)
+	small.fill(Color(0.6, 0.3, 0.3, 1.0))
+	small.save_png(probe_dir.path_join("portrait.png"))
+	var body := {
+		"id": "apk_probe", "display_name": "PROBE", "image": "portrait.png",
+		"cols": 20, "rows": 26, "cell": 12.0, "origin": [30, 64],
+		"channel": {"fork": [10, 18], "stem_cols": [10, 11], "stem_bottom": 25,
+			"arm_width": 3, "arms": [[4, 8], [16, 8]]},
+		"powerup_tips": [[4, 8], [16, 8]], "unbreakable_cells": [],
+	}
+	var f := FileAccess.open(probe_dir.path_join("apk_probe.json"), FileAccess.WRITE)
+	f.store_string(JSON.stringify(body))
+	f.close()
+	var probe := BreakoutLevel.load_level(probe_dir.path_join("apk_probe.json"))
+	var scaled_ok := bool(probe.get("ok", false)) \
+		and int(probe["cols"]) == 20 and int(probe["rows"]) == 26 \
+		and (probe["grid"] as Array).size() == 20 * 26 and int(probe["bricks"]) > 300
+	details.append("mismatched png 10x12 -> grid 20x26 ok=%s bricks=%d" % [
+		str(scaled_ok), int(probe.get("bricks", 0))])
+	all_ok = all_ok and scaled_ok
+	_suite("apk_level_loader", all_ok, " | ".join(details))
 
 
 func _check_ball_bounce(g: Node) -> void:
@@ -275,8 +329,8 @@ func _check_multiball_times3(g: Node) -> void:
 	for i in 8:
 		await get_tree().physics_frame
 	var after := int(g.ball_count())
-	# 120 mirrors BreakoutGame.MAX_BALLS (the test harness cannot see it).
-	var want := mini(before * 3, 120)
+	var cap := int(g.ball_cap())
+	var want := mini(before * 3, cap)
 	var ok := after == want and int(g.powerups_caught) == caught_before + 1
 	_suite("multiball_times3", ok, "balls %d -> %d (want %d) caught=%d" % [
 		before, after, want, int(g.powerups_caught)])
@@ -436,25 +490,77 @@ func _check_powerup_star(g: Node) -> void:
 
 
 ## The drop pool: measured rates over a fixed-seed sample of the SAME picker
-## gameplay uses. Stage C pool: +3 55%, x3 20%, minus 10%, star 5%, floor 10%.
+## gameplay uses. Brief 22 pool: +3 54%, x3 20%, minus 10%, star 5%,
+## floor 10%, NUKE 2%.
 func _check_drop_pool(g: Node) -> void:
 	var n := 2000
-	var counts := {"plus3": 0, "times3": 0, "minus": 0, "star": 0, "floor": 0}
+	var counts := {"plus3": 0, "times3": 0, "minus": 0, "star": 0, "floor": 0, "nuke": 0}
 	g.rng.seed = 20261116
 	for i in n:
 		counts[g._pick_powerup_kind()] += 1
 	var r_plus := float(counts["plus3"]) / float(n)
+	# --- the cap the pool is measured against lives in the game, not here
 	var r_times := float(counts["times3"]) / float(n)
 	var r_minus := float(counts["minus"]) / float(n)
 	var r_star := float(counts["star"]) / float(n)
 	var r_floor := float(counts["floor"]) / float(n)
-	var total := r_plus + r_times + r_minus + r_star + r_floor
-	var ok := absf(r_plus - 0.55) < 0.04 and absf(r_times - 0.20) < 0.04 \
+	var r_nuke := float(counts["nuke"]) / float(n)
+	var total := r_plus + r_times + r_minus + r_star + r_floor + r_nuke
+	var ok := absf(r_plus - 0.53) < 0.04 and absf(r_times - 0.20) < 0.04 \
 		and absf(r_minus - 0.10) < 0.03 and absf(r_star - 0.05) < 0.02 \
-		and absf(r_floor - 0.10) < 0.03 and absf(total - 1.0) < 0.001
-	_suite("drop_pool", ok, "plus3=%.1f%% times3=%.1f%% minus=%.1f%% star=%.1f%% floor=%.1f%% sum=%.3f (n=%d)" % [
+		and absf(r_floor - 0.10) < 0.03 and absf(r_nuke - 0.02) < 0.015 \
+		and absf(total - 1.0) < 0.001
+	_suite("drop_pool", ok, "plus3=%.1f%% times3=%.1f%% minus=%.1f%% star=%.1f%% floor=%.1f%% nuke=%.1f%% sum=%.3f (n=%d)" % [
 		r_plus * 100.0, r_times * 100.0, r_minus * 100.0, r_star * 100.0,
-		r_floor * 100.0, total, n])
+		r_floor * 100.0, r_nuke * 100.0, total, n])
+
+
+## Brief 22 — the NUKE. One catch breaks EVERY breakable brick inside the
+## blast radius of the lowest remaining brick, through the real break_cell
+## path (so bricks_left/score/drops/WIN all agree), and never breaks a wall.
+func _check_nuke(g: Node) -> void:
+	# No ball may be in flight while the blast count is computed: a stray ball
+	# that broke a brick in between would make expect != broke for a reason
+	# that has nothing to do with the nuke.
+	g.debug_clear_balls()
+	await get_tree().physics_frame
+	g.debug_ensure_playing()
+	g.debug_clear_powerups()
+	g.debug_ensure_playing()
+	var blast: Vector2i = g._nuke_blast_cell()
+	var r := int(g.NUKE_RADIUS)
+	var expect := 0
+	var lowest := -1
+	var walls_before := 0
+	for c in g._bodies.keys():
+		var cellp: Vector2i = c
+		var b: Brick = g._bodies[c]
+		if b.unbreakable:
+			walls_before += 1
+			continue
+		lowest = maxi(lowest, cellp.y)
+		var dx := absi(cellp.x - blast.x)
+		var dy := absi(cellp.y - blast.y)
+		if dx * dx + dy * dy <= r * r:
+			expect += 1
+	var before := int(g.bricks_left)
+	g.debug_spawn_powerup_at_paddle("nuke")
+	for i in 8:
+		await get_tree().physics_frame
+	var broke := before - int(g.bricks_left)
+	var walls_after := 0
+	for c2 in g._bodies.keys():
+		if (g._bodies[c2] as Brick).unbreakable:
+			walls_after += 1
+	var ok := int(g.nukes_caught) == 1 and broke == expect and expect > 100 \
+		and walls_after == walls_before and int(g.nuke_bricks) == broke \
+		and blast.y == lowest
+	_suite("powerup_nuke", ok,
+		"blast=%s (lowest=%d) broke=%d expected=%d caught=%d walls %d->%d telemetry=%d" % [
+			str(blast), lowest, broke, expect, int(g.nukes_caught),
+			walls_before, walls_after, int(g.nuke_bricks)])
+	g.debug_clear_powerups()
+	g.debug_ensure_playing()
 
 
 # ================================================================== Stage C
@@ -527,7 +633,9 @@ func _check_times3_cap(g: Node) -> void:
 	g.auto_play = false
 	g.debug_ensure_playing()
 	g.debug_clear_balls()
-	for i in 50:
+	# Start above 1/3 of the cap so the split MUST be clipped by it (the
+	# reference cap is 120, so 100 balls ask for 300).
+	for i in 100:
 		g.debug_spawn_ball(Vector2(60.0 + float(i % 20) * 20.0, 600.0 - float(i / 20) * 12.0),
 			Vector2(0, -420))
 	g.debug_ensure_playing()
@@ -535,9 +643,9 @@ func _check_times3_cap(g: Node) -> void:
 	var added := int(g._split_balls_in_place())
 	var after := int(g.ball_count())
 	g.debug_clear_balls()
-	# 120 mirrors BreakoutGame.MAX_BALLS (the harness cannot see the const).
-	var ok := before == 50 and after == 120 and added == 70
-	_suite("times3_cap", ok, "balls %d -> %d (added %d, cap 120)" % [before, after, added])
+	var cap := int(g.ball_cap())
+	var ok := before == 100 and after == cap and added == cap - 100
+	_suite("times3_cap", ok, "balls %d -> %d (added %d, cap %d)" % [before, after, added, cap])
 
 
 ## --- item 5: the combo chain --------------------------------------------
@@ -1060,7 +1168,53 @@ func _suite_editor() -> void:
 		str(Game.level_id),
 		int(scene.bricks_left) if scene != null and scene.has_signal("game_ended") else -1])
 
+	await _check_editor_import(ed)
+
 	await _report("WR_BREAKOUT_EDITOR_RESULT", _fails == 0, "failing suites: %d" % _fails)
+
+
+## Task 2 — IMPORT ANY ART. A 37x91 image (neither the grid nor an aspect the
+## grid shares) is stretched onto a 20x26 grid, saved as the standard pair and
+## loaded back by the game's own loader; then the same art goes onto an 80x100
+## grid, the shipped Ronaldo size. Nothing may end in a size dead end.
+func _check_editor_import(ed: Node) -> void:
+	var src_path := "user://breakout_import_probe_37x91.png"
+	var img := Image.create(37, 91, false, Image.FORMAT_RGBA8)
+	for y in 91:
+		for x in 37:
+			img.set_pixel(x, y, Color(float(x) / 36.0, float(y) / 90.0, 0.35, 1.0))
+	img.save_png(ProjectSettings.globalize_path(src_path))
+
+	ed.new_level(20, 26)
+	ed.level_id = "editor_import_20x26"
+	var res: Dictionary = ed.import_art(src_path)
+	var cnt: Dictionary = ed.counts()
+	var imp_ok: bool = bool(res.get("ok", false)) and int(res.get("cols", 0)) == 20 \
+		and int(res.get("rows", 0)) == 26 and int(cnt["bricks"]) > 300
+	var saved: Dictionary = ed.save_to("user://breakout_editor_test")
+	var lv: Dictionary = BreakoutLevel.load_level(str(saved.get("json", "")))
+	var png: Image = BreakoutLevel.load_png_image(str(lv.get("image", "")))
+	var round_ok: bool = bool(saved.get("ok", false)) and bool(lv.get("ok", false)) \
+		and int(lv.get("cols", 0)) == 20 and int(lv.get("rows", 0)) == 26 \
+		and png != null and png.get_width() == 20 and png.get_height() == 26
+	_suite("editor_import_any_size", imp_ok and round_ok,
+		"37x91 -> 20x26 import=%s bricks=%d saved=%s loader=%s png=%s" % [
+			str(imp_ok), int(cnt["bricks"]), str(saved.get("ok", false)),
+			str(lv.get("ok", false)),
+			"%dx%d" % [png.get_width(), png.get_height()] if png != null else "null"])
+
+	# The same art onto the 80x100 Ronaldo grid, played through the loader.
+	ed.new_level(80, 100)
+	ed.level_id = "editor_import_80x100"
+	var res80: Dictionary = ed.import_art(src_path, 80, 100)
+	var saved80: Dictionary = ed.save_to("user://breakout_editor_test")
+	var lv80: Dictionary = BreakoutLevel.load_level(str(saved80.get("json", "")))
+	var big_ok: bool = bool(res80.get("ok", false)) and bool(saved80.get("ok", false)) \
+		and bool(lv80.get("ok", false)) and int(lv80.get("cols", 0)) == 80 \
+		and int(lv80.get("rows", 0)) == 100 and int(lv80.get("breakable", 0)) > 3000
+	_suite("editor_import_ronaldo_grid", big_ok,
+		"37x91 -> 80x100 ok=%s breakable=%d tiles=%d" % [
+			str(big_ok), int(lv80.get("breakable", 0)), int(lv80.get("bricks", 0))])
 
 
 # ------------------------------------------------------------------ smoke
@@ -1207,12 +1361,34 @@ func _suite_sim() -> void:
 				int(g.score), bx, by, bv.x, bv.y, bs, float(g.paddle.position.x),
 				now - last_break_at])
 	Engine.time_scale = 1.0
+	# dump=1: print where the LAST breakable bricks are, as an ASCII map of the
+	# live grid ('o' breakable, '#' unbreakable, '.' empty). This is how a tail
+	# stall is diagnosed: unreachable pockets vs bricks that are merely far apart.
+	if _args.has("dump=1"):
+		var live := {}
+		for c in g._bodies.keys():
+			live[c] = not (g._bodies[c] as Brick).unbreakable
+		var gc := int(g.cols)
+		var gr := int(g.rows)
+		print("WR_BREAKOUT_SIM_DUMP cols=%d rows=%d left=%d" % [gc, gr, int(g.bricks_left)])
+		for rr in gr:
+			var line := "%3d " % rr
+			for cc in gc:
+				var key := Vector2i(cc, rr)
+				if not live.has(key):
+					line += "."
+				elif bool(live[key]):
+					line += "o"
+				else:
+					line += "#"
+			print("WR_BREAKOUT_SIM_DUMP %s" % line)
 	var won := ended.size() == 1 and bool((ended[0] as Dictionary).get("won", false))
-	print("WR_BREAKOUT_SIM level=%s seed=%d won=%s elapsed=%.1f bricks_left=%d bricks_total=%d score=%d lives=%d hits=%d longest_stall=%.1fs ball_x=[%.0f..%.0f] stars=%d/%d" % [
+	print("WR_BREAKOUT_SIM level=%s seed=%d won=%s elapsed=%.1f bricks_left=%d bricks_total=%d score=%d lives=%d hits=%d longest_stall=%.1fs ball_x=[%.0f..%.0f] stars=%d/%d nukes=%d nuke_bricks=%d peak_balls=%d" % [
 		want, seedv, str(won), float(g.elapsed), int(g.bricks_left), int(g.bricks_total),
 		int(g.score), int(g.lives), int(g.brick_hits), longest_stall,
 		min_x if min_x < 1.0e9 else -1.0, max_x if max_x > -1.0e9 else -1.0,
-		int(g.stars_collected), int(g.stars_dropped)])
+		int(g.stars_collected), int(g.stars_dropped),
+		int(g.nukes_caught), int(g.nuke_bricks), int(g.peak_balls)])
 	await _report("WR_BREAKOUT_SIM_RESULT", won,
 		"level=%s seed=%d won=%s at %.1fs (longest stall %.1fs, bricks_left %d)" % [
 			want, seedv, str(won), float(g.elapsed), longest_stall, int(g.bricks_left)])

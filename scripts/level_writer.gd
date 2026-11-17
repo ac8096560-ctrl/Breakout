@@ -13,7 +13,10 @@ class_name BreakoutLevelWriter extends RefCounted
 ##
 ## Validation REFUSES and explains; it never silently repairs a level.
 
-const SHIPPED_IDS := ["level_01_portrait", "level_02_jensen"]
+## Every level that ships in data/levels. The editor's find_all() only lists
+## these ids, so a shipped level missing here cannot be opened in the editor
+## even though the game plays it.
+const SHIPPED_IDS := ["level_01_portrait", "level_02_jensen", "level_03_solid_path", "level_04_ronaldo"]
 const RES_DIR := "res://data/levels"
 const USER_DIR := "user://levels"
 

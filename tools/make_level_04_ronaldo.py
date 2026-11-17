@@ -24,9 +24,16 @@ own:
 
 Structural cells (the only places the art is touched):
   * the black channel  -> EMPTY   (the ball's path; carved, not painted)
-  * the grey walls     -> SOLID grey (listed in unbreakable_cells)
+  * the grey WALL COLUMNS 9 and 12 -> SOLID grey (listed in unbreakable_cells)
   * the red border ring -> SOLID red (listed in unbreakable_cells, like level_02)
   * the left cavity (cols 2-5, black pixels) -> SOLID red (unbreakable)
+
+v4 (Brief 22): ONLY the two wall columns are grey-unbreakable. The v3 rule
+marked EVERY grey-ish art pixel unbreakable (309 cells, 261 of them in the
+face/hair rows 0-44), and those solid cells shielded their breakable
+neighbours from the ball — the tail of a take collapsed to ~3.5 bricks/s and
+level_04 could not be won. Grey art pixels elsewhere now stay BREAKABLE and
+keep their own colour; only the corridor's two wall columns are walls.
 
 Everything else is the art's own colour, breakable, so the portrait is never
 cut by the corridor: no cell of the face is turned into channel.
@@ -71,8 +78,16 @@ WALL_COLS = (9, 12)
 WALL_TOP = 23
 WALL_BOTTOM = 99
 
-# The left empty cavity: cols 2-5, 49-58/71 black in rows 25-95. Filled red.
-CAVITY_COLS = range(2, 6)
+# The left frame strip: cols 1-5, between the red border ring (col 0) and the
+# portrait's own wall column (col 9). v3 filled only the BLACK pixels of the
+# cavity (cols 2-5), which left col 1 as a 1-CELL-WIDE slot: 6 px of space for
+# an 8 px ball, so 64 bricks in it could never be touched by any ball. A
+# --breakout-sim dump=1 run at t=100 s showed those 64 as the level's tail.
+# v4 makes the whole strip SOLID red unbreakable (the same structural rule the
+# border ring and the cavity already follow), so every breakable brick left in
+# level_04 is reachable by the ball.
+FRAME_COLS = range(1, 6)
+CAVITY_COLS = range(2, 6)   # kept for the report/print: the strip that was black
 
 BORDER = set()
 for c in range(COLS):
@@ -105,6 +120,7 @@ def main():
     solid = 0
     art_cells = 0
     cavity_filled = 0
+    frame_filled = 0
     wall_gap_filled = 0
     unbreakable = set(BORDER)
     for r in range(ROWS):
@@ -118,15 +134,23 @@ def main():
                 grid[r][c] = RED_OUTER + (255,)
                 solid += 1
                 continue
-            # Left cavity: black pixels become solid red (unbreakable).
-            if c in CAVITY_COLS and is_black(col):
+            # The left frame strip (cols 1-5) is SOLID red and unbreakable.
+            # v3 filled only its black pixels, and the 1-cell slot that left at
+            # col 1 held 64 bricks an 8 px ball can never reach (see FRAME_COLS).
+            if c in FRAME_COLS:
                 grid[r][c] = RED_OUTER + (255,)
                 unbreakable.add(cell)
                 solid += 1
-                cavity_filled += 1
+                frame_filled += 1
+                if is_black(col):
+                    cavity_filled += 1
                 continue
-            # Grey walls: the art's grey is unbreakable; a black gap inside a
-            # wall column is filled grey so the wall is continuous.
+            # Grey walls: ONLY the two wall columns are unbreakable; a black gap
+            # inside a wall column is filled grey so the wall is continuous.
+            # (v4) A grey ART pixel outside those columns is an ordinary
+            # breakable brick — it keeps the art's colour, only its solidity
+            # used to be wrong, and 309 solid face cells are what stalled the
+            # tail of every take.
             if c in WALL_COLS and WALL_TOP <= r <= WALL_BOTTOM:
                 if is_grey(col):
                     g = GREY_LIGHT if c == 9 else GREY_DARK
@@ -141,11 +165,6 @@ def main():
                     solid += 1
                     wall_gap_filled += 1
                     continue
-            if is_grey(col):
-                grid[r][c] = (GREY_DARK[0], GREY_DARK[1], GREY_DARK[2], 255)
-                unbreakable.add(cell)
-                solid += 1
-                continue
             if is_black(col):
                 grid[r][c] = (0, 0, 0, 0)
                 continue
@@ -195,8 +214,8 @@ def main():
         json.dump(body, f, indent=1)
         f.write("\n")
 
-    print("solid=%d art=%d cavity_filled=%d wall_gap_filled=%d unbreakable=%d channel=%d" % (
-        solid, art_cells, cavity_filled, wall_gap_filled, len(ub), len(CHANNEL)))
+    print("solid=%d art=%d frame=%d (was black: %d) wall_gap_filled=%d unbreakable=%d channel=%d" % (
+        solid, art_cells, frame_filled, cavity_filled, wall_gap_filled, len(ub), len(CHANNEL)))
     for r in range(0, ROWS, 2):
         line = ""
         for c in range(COLS):

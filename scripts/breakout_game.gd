@@ -26,36 +26,74 @@ const VIEW := Vector2(540, 960)
 ## ending at 664 the return trip is short, which is what makes the brick rate
 ## of the reference reachable.
 const PADDLE_Y := 760.0
+## The reference pace, unchanged: 420 px/s is the take level_01/02/03 were
+## tuned at, and a swept move_and_collide query makes any of these speeds
+## tunnel-proof on the 4 px level_04 bricks.
 const BALL_SPEED := 420.0
+## Brief 22's DENSE-FIELD ball set. A 60-90 s take on a ~5,000-brick 80x100
+## field needs ~2x the brick rate a 962-brick field needs, and a ball's
+## collision rate scales with its speed and with how many balls are in play.
+## Applying that to every level would shorten the already-tuned 962-brick
+## takes by ~25% (measured), so it is applied only to a DENSE field — see
+## DENSE_BRICKS. 570 px/s is a 0.45 s wall-to-wall crossing in the portrait.
+const BALL_SPEED_DENSE := 570.0
 ## Serve angle, degrees from straight up. The solid border leaves only the
-## 2-cell stem gap (24 px wide, 16 px for the ball centre) as the entry, and
-## a wide serve settles into a bounce loop below the border instead of ever
-## threading it — the reference ball goes straight up the stem. ±2 deg drifts
-## ~3 px over the trip to the gap, so the serve threads it cleanly on the
-## first trip while keeping a touch of variety per seed. (±5 deg would drift
-## ~7.5 px and nearly clip the border.)
+## 2-cell stem gap as the entry and the reference ball goes straight up it, so
+## the serve is aimed at the stem and kept inside the gap. The angle is NOT a
+## flat constant any more (Brief 22): 2 deg drifts tan(2 deg) * 74 px ~ 2.6 px
+## over the trip to the gap, which threads level_01's 24 px stem but misses
+## level_04's 12 px one (a 4 px window for an 8 px ball) — measured as a 19 s
+## opening stall in which the first ball never entered the field. The angle is
+## now derived from the level's own stem width (see _serve_angle_deg), so every
+## level threads its stem, and SERVE_ANGLE_DEG is the cap.
 const SERVE_ANGLE_DEG := 2.0
 const START_LIVES := 3
 const READY_SECONDS := 1.2
 const LOST_SECONDS := 0.7
 const LOSS_Y := 1000.0
 const MAX_BALLS := 120
+## Brief 22's dense-field cap (see BALL_SPEED_DENSE): on the dense 80x100 field
+## the ball count — not only the ball speed — is what keeps the brick rate up
+## once the field thins out (a ball that finds no brick for a second is a
+## wasted ball).
+const MAX_BALLS_DENSE := 180
+## A field with this many breakable bricks plays at the dense-field pace. Only
+## level_04 (4,951 breakable) is above it: level_01 is 962, level_02 1,724,
+## level_03 1,064, so those three keep the reference pace they were tuned at.
+const DENSE_BRICKS := 2500
 const MAX_POWERUPS := 40
-## Chance per broken brick of dropping a "+3", plus two guaranteed drops that
+## Chance per broken brick of dropping a power-up (the pool below picks which),
+## plus two guaranteed drops that
 ## put the first multi-ball on screen around the reference's t=8s: the channel's
 ## two tip cells always drop one, and so does the FIRST_DROP_BRICKS-th brick of
 ## a take (whichever brick that turns out to be — the outcome still comes from
 ## play, nothing is scripted).
 const POWERUP_CHANCE := 0.20
-## The drop pool (Stage C, item 3). The five kinds sum to exactly 1.0:
-##   +3 55%   x3 20%   minus 10%   star 5%   safety floor 10%
+## The drop pool. The six kinds sum to exactly 1.0:
+##   +3 52%   x3 20%   minus 9%   star 5%   safety floor 10%   NUKE 4%
 ## "+3"/"x3" keep the reference's multi-ball rhythm; minus/star stay rare so
-## the first multi-ball still lands around t=8 s and a take still wins in
-## about 70 s; the floor is a real defensive drop at 10%.
-const DROP_WEIGHTS := {"plus3": 0.55, "times3": 0.20, "minus": 0.10, "star": 0.05, "floor": 0.10}
+## the first multi-ball still lands around t=8 s; the floor is a real defensive
+## drop at 10%; the NUKE (Brief 22) is the rarest drop because ONE catch can
+## erase a 10-cell radius, and it is what ends a dense level's tail.
+const DROP_WEIGHTS := {"plus3": 0.52, "times3": 0.20, "minus": 0.09, "star": 0.05, "floor": 0.10, "nuke": 0.04}
 ## The fixed pick order. It is also the order the rng is consumed in, so a
 ## seeded take stays deterministic.
-const DROP_ORDER := ["plus3", "times3", "minus", "star", "floor"]
+const DROP_ORDER := ["plus3", "times3", "minus", "star", "floor", "nuke"]
+## ---------------- Brief 22: the NUKE -------------------------------------
+## One catch detonates a radial blast that breaks EVERY breakable brick within
+## NUKE_RADIUS (14) cells of the blast cell (Euclidean, in CELLS, so it is the same
+## number of bricks on a 12 px grid and on level_04's 6 px grid).
+##
+## The blast cell is the LOWEST remaining breakable brick (ties: nearest the
+## field's centre column). That rule is what makes the drop matter where a take
+## actually stalls: the last few hundred bricks of a dense level sit lowest and
+## are the ones a 120-ball field keeps missing, while early on the same blast
+## just takes a bite out of a still-dense field. Nothing is scripted — the drop
+## is an ordinary pool draw and the blast breaks through the normal break_cell
+## path (score, combo, drops and the win rule all still apply).
+const NUKE_RADIUS := 14
+## Unbreakable cells (the border and level_04's two grey wall columns) are
+## walls and are never broken by a blast.
 ## Stage B DESIGN CHOICES (the reference study does not resolve these):
 ##   orange "—"  removes exactly ONE ball, and does nothing at one ball, so the
 ##               debuff can never cause a loss by itself.
@@ -124,6 +162,9 @@ var powerups_caught := 0
 var peak_balls := 1
 var brick_hits := 0
 var peak_combo := 1
+## Brief 22 NUKE telemetry: how many were caught / how many bricks a blast took.
+var nukes_caught := 0
+var nuke_bricks := 0
 
 var rng := RandomNumberGenerator.new()
 var field: BrickField
@@ -302,6 +343,21 @@ func cell_center(c: Vector2i) -> Vector2:
 	return origin + (Vector2(c) + Vector2(0.5, 0.5)) * cell
 
 
+## Brief 22 pacing rule: a DENSE field (see DENSE_BRICKS) plays with the fast,
+## high-ball-count set; every other field keeps the reference pace. Read from
+## the level that actually loaded, never from its id.
+func is_dense_field() -> bool:
+	return bricks_total >= DENSE_BRICKS
+
+
+func ball_speed() -> float:
+	return BALL_SPEED_DENSE if is_dense_field() else BALL_SPEED
+
+
+func ball_cap() -> int:
+	return MAX_BALLS_DENSE if is_dense_field() else MAX_BALLS
+
+
 # ------------------------------------------------------------------ flow
 ## Game x of the channel stem centre, read from the level's stem_cols so the
 ## serve aims at the entry gap on every level (level_01 and level_02 both use
@@ -329,11 +385,30 @@ func _start_play() -> void:
 		# stem gap is the only way in. The paddle is centred on the stem
 		# first (a no-op in auto-play, where it already sits there).
 		paddle.move_to_x(_stem_centre_x())
-		var ang := deg_to_rad(rng.randf_range(-SERVE_ANGLE_DEG, SERVE_ANGLE_DEG))
+		var lim := _serve_angle_deg()
+		var ang := deg_to_rad(rng.randf_range(-lim, lim))
 		_held_ball.position = paddle.position + Vector2(0, -22.0)
-		_held_ball.launch(Vector2(sin(ang), -cos(ang)) * (BALL_SPEED + rng.randf_range(-12.0, 12.0)))
+		_held_ball.launch(Vector2(sin(ang), -cos(ang)) * (ball_speed() + rng.randf_range(-12.0, 12.0)))
 	_held_ball = null
 	state_changed.emit(state)
+
+
+## The widest serve angle THIS level can thread: the ball must still be inside
+## the stem gap when it reaches the bottom of the brick field. Derived from the
+## level's stem width and cell size (never a hardcoded per-level value), so a
+## 12 px stem gets a ~1 deg serve and a 24 px stem keeps the full 2 deg.
+func _serve_angle_deg() -> float:
+	var sc: Array = level.get("stem_cols", [])
+	if sc.size() != 2 or cell <= 0.0:
+		return SERVE_ANGLE_DEG
+	var stem_w := (float(sc[1]) - float(sc[0]) + 1.0) * cell
+	# Half the gap, minus the ball, times a safety factor: the serve may use
+	# only ~60% of the room it has.
+	var slack := maxf(0.0, stem_w * 0.5 - Ball.RADIUS) * 0.6
+	var travel := maxf(20.0, PADDLE_Y - (origin.y + float(rows) * cell))
+	if slack <= 0.0:
+		return 0.0
+	return clampf(rad_to_deg(atan(slack / travel)), 0.0, SERVE_ANGLE_DEG)
 
 
 func _physics_process(delta: float) -> void:
@@ -366,8 +441,9 @@ func _serve_again() -> void:
 	# from wherever the paddle happened to be can never find the gap.
 	paddle.move_to_x(_stem_centre_x())
 	var b := _new_ball(paddle.position + Vector2(0, -22.0))
-	var ang := deg_to_rad(rng.randf_range(-SERVE_ANGLE_DEG, SERVE_ANGLE_DEG))
-	b.launch(Vector2(sin(ang), -cos(ang)) * BALL_SPEED)
+	var lim := _serve_angle_deg()
+	var ang := deg_to_rad(rng.randf_range(-lim, lim))
+	b.launch(Vector2(sin(ang), -cos(ang)) * ball_speed())
 	state_changed.emit(state)
 
 
@@ -431,6 +507,7 @@ func _finish(won: bool) -> void:
 		"first_multiball_at": first_multiball_at,
 		"stars": stars_collected, "stars_dropped": stars_dropped,
 		"stars_lost": stars_lost, "peak_combo": peak_combo,
+		"nukes": nukes_caught, "nuke_bricks": nuke_bricks,
 	})
 
 
@@ -487,25 +564,61 @@ func _auto_target() -> float:
 			_aim_arrival = arrival
 			_aim_rel = _plan_aim_rel(arrival)
 		return arrival - _aim_rel * Paddle.SIZE.x * 0.5
-	# 3) No ball is arriving for a moment: chase the lowest falling power-up,
-	# which is what keeps a multi-ball take alive (and is why a recorded take
-	# reaches the reference's ball counts).
-	var pick: PowerUp = null
-	var pick_y := -1.0e9
+	# 3) A drop is catchable before the next save: take it. Brief 22 replaced
+	# "chase whichever drop is lowest" with a VALUE-WEIGHTED pick — a NUKE is
+	# worth more than a "+3", the "-1 ball" debuff is never chased, and the
+	# 3-star collectibles are picked up too — because catching the big drops is
+	# what turns a 120-ball field into a cleared level.
+	var drop_x := _best_pickup_x()
+	if drop_x >= 0.0:
+		var travel := absf(drop_x - paddle.position.x) / 1500.0
+		if best == null or best_eta > travel + 0.30:
+			return drop_x
+	if best != null:
+		return _lead_x(best)
+	return paddle.position.x
+
+
+## What the AI thinks each falling drop is worth. Positive = worth a detour;
+## "minus" is negative because it only removes a ball, so the paddle ignores it.
+const PICKUP_VALUE := {"nuke": 9.0, "star": 7.0, "times3": 5.0, "plus3": 4.0, "floor": 2.0, "minus": -2.0}
+
+
+## The x of the best falling pickup to go and catch right now (-1 when there
+## is none). Score = value - time-to-paddle - sideways distance, so the biggest
+## drop wins unless it is about to be lost anyway. Both power-ups and the
+## 3-star collectibles are considered.
+func _best_pickup_x() -> float:
+	var best := 0.0
+	var best_x := -1.0
+	var line := paddle.position.y
 	for p in _powerups:
 		if not is_instance_valid(p):
 			continue
 		var up := p as PowerUp
-		if not up.alive or up.position.y > paddle.position.y:
+		if not up.alive or up.position.y > line:
 			continue
-		if up.position.y > pick_y:
-			pick_y = up.position.y
-			pick = up
-	if pick != null:
-		return pick.position.x
-	if best != null:
-		return _lead_x(best)
-	return paddle.position.x
+		var value := float(PICKUP_VALUE.get(up.kind, 1.0))
+		if value <= 0.0:
+			continue
+		var eta := maxf(0.0, (line - up.position.y) / PowerUp.FALL_SPEED)
+		var score := value * 10.0 - eta * 0.8 - absf(up.position.x - paddle.position.x) * 0.02
+		if score > best:
+			best = score
+			best_x = up.position.x
+	for s in _stars:
+		if not is_instance_valid(s):
+			continue
+		var st := s as StarPickup
+		if not st.alive or st.position.y > line:
+			continue
+		var eta2 := maxf(0.0, (line - st.position.y) / StarPickup.FALL_SPEED)
+		var score2 := float(PICKUP_VALUE["star"]) * 10.0 - eta2 * 0.8 \
+			- absf(st.position.x - paddle.position.x) * 0.02
+		if score2 > best:
+			best = score2
+			best_x = st.position.x
+	return best_x
 
 
 ## The x where a falling ball crosses the paddle line, WITH the side walls
@@ -799,13 +912,14 @@ func _on_ball_hit(collider: Node, _normal: Vector2, b: Ball) -> void:
 
 func _add_balls(n: int, at: Vector2) -> int:
 	var added := 0
+	var cap := ball_cap()
 	for i in n:
-		if _balls.size() >= MAX_BALLS:
+		if _balls.size() >= cap:
 			break
 		var ang := deg_to_rad(rng.randf_range(-62.0, 62.0))
 		var pos := Vector2(clampf(at.x, 12.0, 528.0), clampf(at.y, 80.0, PADDLE_Y - 40.0))
 		var b := _new_ball(pos)
-		b.launch(Vector2(sin(ang), -cos(ang)) * BALL_SPEED)
+		b.launch(Vector2(sin(ang), -cos(ang)) * ball_speed())
 		added += 1
 	return added
 
@@ -820,6 +934,7 @@ func _add_balls(n: int, at: Vector2) -> int:
 func _split_balls_in_place() -> int:
 	var parents: Array = _balls.duplicate()
 	var added := 0
+	var cap := ball_cap()
 	for parent in parents:
 		if not is_instance_valid(parent):
 			continue
@@ -828,7 +943,7 @@ func _split_balls_in_place() -> int:
 		if not b.active or b.vel.length_squared() < 1.0:
 			continue
 		for side in [-1.0, 1.0]:
-			if _balls.size() >= MAX_BALLS:
+			if _balls.size() >= cap:
 				return added
 			var child := _new_ball(b.position)
 			child.launch(b.vel.rotated(deg_to_rad(SPLIT_SPREAD_DEG) * side))
@@ -909,6 +1024,8 @@ func _drop_powerup(at: Vector2) -> void:
 			p.tint = pal.get("star", Color(0.98, 0.82, 0.28))
 		"floor":
 			p.tint = pal.get("safety_floor", Color(0.30, 0.90, 0.95))
+		"nuke":
+			p.tint = pal.get("powerup_nuke", Color(1.0, 0.25, 0.72))
 		_:
 			p.tint = pal.get("powerup_blue", Color(0.22, 0.48, 0.92)) if rng.randi() % 2 == 0 \
 				else pal.get("powerup_green", Color(0.20, 0.70, 0.36))
@@ -960,9 +1077,70 @@ func _collect_powerup(up: PowerUp) -> void:
 			score += STAR_BONUS
 			score_mult = STAR_MULT
 			star_left = STAR_SECONDS
+		"nuke":
+			# Brief 22: radial blast, described in NUKE_RADIUS above.
+			_detonate_nuke()
 		_:
 			_add_balls(3, at)
 	paddle.show_buff(BUFF_SECONDS)
+
+
+## Brief 22 — the NUKE blast. shatter every breakable brick inside
+## NUKE_RADIUS cells of the blast cell through the normal break_cell() path,
+## so scoring, combos, drops, star milestones and the win rule all behave
+## exactly as in normal play. Walls (unbreakable cells) are left standing.
+## Returns the number of bricks broken.
+func _detonate_nuke() -> int:
+	if state != STATE_PLAYING:
+		return 0
+	var blast := _nuke_blast_cell()
+	if blast.x < 0:
+		return 0
+	var centre := cell_center(blast)
+	var r2 := NUKE_RADIUS * NUKE_RADIUS
+	var broke := 0
+	for c in _bodies.keys():
+		var cellp: Vector2i = c
+		var dx := absi(cellp.x - blast.x)
+		var dy := absi(cellp.y - blast.y)
+		if dx * dx + dy * dy > r2:
+			continue
+		var b: Brick = _bodies[c]
+		if b.unbreakable:
+			continue
+		break_cell(cellp, true)
+		broke += 1
+		if state != STATE_PLAYING:
+			# The blast cleared the level (the win rule fired inside break_cell).
+			break
+	nukes_caught += 1
+	nuke_bricks += broke
+	var tint: Color = pal.get("powerup_nuke", Color(1.0, 0.25, 0.72))
+	FX.flash(fx_root, centre, tint, 150.0, 0.55)
+	FX.ring(fx_root, centre, tint, 120.0, 0.60)
+	FX.ring(fx_root, centre, Color(1, 1, 1, 0.9), 70.0, 0.40)
+	AudioManager.play("powerup")
+	return broke
+
+
+## The cell a NUKE detonates on: the lowest remaining breakable brick, ties
+## broken by the closest to the field's centre column. -1 when the field has
+## no breakable brick left.
+func _nuke_blast_cell() -> Vector2i:
+	var best := Vector2i(-1, -1)
+	var best_row := -1
+	var best_dx := 1.0e9
+	for c in _bodies.keys():
+		var cellp: Vector2i = c
+		var b: Brick = _bodies[c]
+		if b.unbreakable:
+			continue
+		var dx := absf(float(cellp.x) - float(cols) * 0.5)
+		if cellp.y > best_row or (cellp.y == best_row and dx < best_dx):
+			best_row = cellp.y
+			best_dx = dx
+			best = cellp
+	return best
 
 
 ## Take exactly one ball out of play. Returns false (and does nothing) at one
@@ -1209,6 +1387,8 @@ func debug_spawn_powerup_at_paddle(kind: String = "plus3") -> PowerUp:
 		p.tint = pal.get("powerup_gold", Color(0.95, 0.75, 0.15))
 	elif kind == "floor":
 		p.tint = pal.get("safety_floor", Color(0.30, 0.90, 0.95))
+	elif kind == "nuke":
+		p.tint = pal.get("powerup_nuke", Color(1.0, 0.25, 0.72))
 	p.position = paddle.position + Vector2(0, -10)
 	powerups_root.add_child(p)
 	_powerups.append(p)

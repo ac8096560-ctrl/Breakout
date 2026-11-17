@@ -14,6 +14,13 @@ class_name PowerUp extends Node2D
 ##            (the overhanging bar is what makes it unmistakable next to the
 ##             three round glyph capsules)
 ##
+## Brief 22 adds the NUKE:
+##   "nuke"   MAGENTA capsule with a white blast STAR + two blast rings that
+##            overhang the capsule -> breaks every breakable brick in a
+##            10-cell radius. It is the only pink drop and the only one with
+##            a pulsing double ring, so it reads on a phone-sized video even
+##            at 9 px.
+##
 ## The scene decides what a catch MEANS; this node only falls and draws itself.
 ##
 ## It falls STRAIGHT DOWN, must be caught by the paddle, and is simply lost if
@@ -82,6 +89,17 @@ func _draw() -> void:
 			draw_rect(Rect2(-13.0, -3.0, 26.0, 2.0),
 				Color(tint.r, tint.g, tint.b, 0.95))
 			draw_rect(Rect2(-9.0, 3.0, 18.0, 2.0), Color(tint.r, tint.g, tint.b, 0.75))
+		"nuke":
+			# The blast: a white four-point star inside two magenta rings that
+			# overhang the capsule, plus the letter N so it never reads as
+			# "that other pink circle".
+			draw_arc(Vector2.ZERO, RADIUS + 1.0, 0.0, TAU, 26, Color(1, 0.55, 0.85, 0.95), 1.6)
+			draw_arc(Vector2.ZERO, RADIUS + 4.0, 0.0, TAU, 26, Color(1, 0.35, 0.75, 0.55), 1.2)
+			for i in 4:
+				var a := float(i) * PI * 0.5
+				var dir := Vector2(cos(a), sin(a))
+				draw_line(dir * 2.0, dir * 8.5, Color(1, 1, 1, 0.95), 2.2)
+			draw_circle(Vector2.ZERO, 3.2, Color(1, 1, 1, 0.98))
 
 
 ## A white five-pointed star, drawn from a polygon (no font dependency).
