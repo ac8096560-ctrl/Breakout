@@ -217,11 +217,20 @@ static func encode_mp4(job: Dictionary) -> Dictionary:
 	if has_audio:
 		args.append_array(["-c:a", "aac", "-b:a", AUDIO_BITRATE,
 			"-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS)])
+		# A/V SYNC (brief 23, part A): the caller passes the take's OWN measured
+		# ratio between the audio it captured and the video it is writing. When
+		# they differ the audio is re-timed by exactly that factor, so both
+		# streams share one time base instead of the audio slowly running ahead.
+		# 1.0 (the normal case on a machine that keeps up) adds no filter at all.
+		var atempo := clampf(float(job.get("atempo", 1.0)), 0.5, 2.0)
+		var af := "apad"
+		if absf(atempo - 1.0) >= 0.0005:
+			af = "atempo=%.6f,apad" % atempo
 		# Audio and video start together and END together. `apad` pads a tap that
 		# ended a block early with silence, and `-t` cuts both streams at the
 		# video's exact length. `-shortest` is NOT used: with an infinite apad
 		# stream it lets the container run past the last frame.
-		args.append_array(["-af", "apad", "-t", "%.6f" % (float(frames) / maxf(0.001, fps))])
+		args.append_array(["-af", af, "-t", "%.6f" % (float(frames) / maxf(0.001, fps))])
 	args.append(out)
 	var log: Array = []
 	var code := OS.execute(str(d.get("ffmpeg", "ffmpeg")), args, log, true)

@@ -189,6 +189,13 @@ func _build_ui() -> void:
 	var bimport := UITheme.button("IMPORT", 12, Color(0.78, 0.45, 0.95), Vector2(100, 34))
 	bimport.pressed.connect(_open_import_dialog)
 	action_row.add_child(bimport)
+	# IMPORT PIXEL FILE: one step from a pixel-art PNG to a saved, playable
+	# level — it picks the file through the same native picker, converts it
+	# 1 pixel = 1 brick, applies the auto-solid grey rule and writes the
+	# PNG + JSON pair into user://levels, where the menu already looks.
+	var bpixel := UITheme.button("IMPORT PIXEL", 11, Color(0.62, 0.42, 0.98), Vector2(112, 34))
+	bpixel.pressed.connect(_open_pixel_import_dialog)
+	action_row.add_child(bpixel)
 	var bplay := UITheme.button("PLAY", 13, Color(0.92, 0.35, 0.35), Vector2(100, 34))
 	bplay.pressed.connect(func() -> void: play())
 	action_row.add_child(bplay)
@@ -388,12 +395,16 @@ func is_channel_cell(c: Vector2i) -> bool:
 	return false
 
 
-## Border-ring cells that are still bricks after the carve, i.e. the list the
-## saved level will carry when the solid border is on.
+## The solid cells the level will carry: the border ring (when the solid
+## border is on) UNION the auto-solid grey rule the loader applies — so the
+## editor PREVIEW marks a grey wall as solid exactly like the game will, and a
+## saved level lists it explicitly as well.
 func unbreakable_cells() -> Array:
-	if not _border_solid:
-		return []
-	return BreakoutLevelWriter.border_unbreakable(_carved()["grid"], cols, rows)
+	var grid: Array = _carved()["grid"]
+	var listed: Array = []
+	if _border_solid:
+		listed = BreakoutLevelWriter.border_unbreakable(grid, cols, rows)
+	return BreakoutLevel.solid_cells(grid, cols, rows, listed)
 
 
 func tips() -> Array:
@@ -600,22 +611,109 @@ func _fork_cell() -> Vector2i:
 
 ## The picker: any image on the device. Importing never needs an import step
 ## from Godot (the PNG is read with FileAccess), so a file from Downloads works.
-func _open_import_dialog() -> void:
+##
+## PART C — PHONE-FRIENDLY IMPORT. `use_native_dialog` must be TRUE: on Android
+## Godot only hands the job to the system picker (Storage Access Framework,
+## ACTION_OPEN_DOCUMENT) when native dialogs are requested with
+## ACCESS_FILESYSTEM. With it false the engine falls back to its own
+## Godot-drawn FileDialog, which is the dialog Choubey could not browse the
+## phone with. On desktop the same property opens the OS dialog (GTK/portal on
+## Linux, the Windows picker); if no native dialog is available there, Godot
+## falls back to its drawn one by itself, so a bare desktop session still
+## works. The picked file arrives as `file_selected` with a path that
+## `BreakoutLevel.load_png_image()` can read (on Android the picker copies it
+## into the app's cache).
+func _open_import_dialog(target := 0, target_rows := 0, pixel_mode := false) -> void:
 	var dlg := FileDialog.new()
-	dlg.title = "IMPORT ANY PORTRAIT ART (%dx%d grid)" % [cols, rows]
+	dlg.title = "IMPORT ANY PORTRAIT ART (%dx%d grid)" % [cols, rows] if not pixel_mode \
+		else "IMPORT PIXEL FILE (1 pixel = 1 brick)"
 	dlg.access = FileDialog.ACCESS_FILESYSTEM
 	dlg.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	dlg.filters = PackedStringArray(["*.png, *.jpg, *.jpeg ; Images"])
-	dlg.use_native_dialog = false
+	dlg.use_native_dialog = true
 	dlg.size = Vector2i(520, 620)
 	dlg.position = Vector2i(10, 200)
 	dlg.file_selected.connect(func(path: String) -> void:
-	#import_art(path)
+		if pixel_mode:
+			import_pixel_file(path)
+		else:
+			import_art(path, target, target_rows)
 		dlg.queue_free())
 	dlg.canceled.connect(func() -> void: dlg.queue_free())
 	add_child(dlg)
 	dlg.popup_centered()
 	_refresh("pick an image — it will be stretched to the %dx%d grid" % [cols, rows])
+
+
+# ------------------------------------------------------- direct pixel import
+## PART D — DIRECT PIXEL-FILE IMPORT.
+## Pick a pixel-art PNG and get a LEVEL: 1 pixel = 1 brick (no stretching), the
+## auto-solid grey rule applied automatically (scripts/level_loader.gd), saved
+## as the normal PNG + JSON pair in user://levels, registered in Game.LEVELS so
+## it shows up in the menu, and left loaded in the editor so PLAY works.
+## Returns {ok, err, id, json, png, cols, rows, bricks, unbreakable}.
+func import_pixel_file(path: String) -> Dictionary:
+	var probe := BreakoutLevel.load_png_image(path)
+	if probe == null:
+		_refresh("PIXEL IMPORT FAILED — cannot decode %s" % path)
+		AudioManager.play("error")
+		return {"ok": false, "err": "cannot decode %s" % path}
+	var pw := clampi(probe.get_width(), 4, 128)
+	var ph := clampi(probe.get_height(), 4, 128)
+	# 1 pixel = 1 brick: the target grid IS the image, so import_art does no
+	# resampling at all and the art keeps its exact pixels.
+	var res := import_art(path, pw, ph)
+	if not bool(res.get("ok", false)):
+		return res
+	level_id = _pixel_level_id(path)
+	display_name = level_id.replace("_", " ").to_upper()
+	topic = "IMPORTED PIXEL ART"
+	var saved := save_to(BreakoutLevelWriter.USER_DIR)
+	if not bool(saved.get("ok", false)):
+		_refresh("PIXEL IMPORT — imported but NOT saved: %s" % str(saved.get("err", "")))
+		AudioManager.play("error")
+		return saved
+	# The menu lists Game.LEVELS, so the new level is playable from it at once.
+	Game.refresh_levels()
+	var idx: int = Game.LEVELS.find(level_id)
+	if idx >= 0:
+		Game.menu_level_idx = idx
+	var cnt := counts()
+	AudioManager.play("confirm")
+	_refresh("PIXEL IMPORT %s  •  %dx%d  •  %d bricks / %d breakable / %d unbreakable (grey walls solid)  •  in the menu" % [
+		level_id, cols, rows, int(cnt["bricks"]), int(cnt["breakable"]), int(cnt["unbreakable"])])
+	return {"ok": true, "err": "", "id": level_id,
+		"json": str(saved.get("json", "")), "png": str(saved.get("png", "")),
+		"cols": cols, "rows": rows, "bricks": int(cnt["bricks"]),
+		"breakable": int(cnt["breakable"]), "unbreakable": int(cnt["unbreakable"])}
+
+
+## A level id for an imported file that cannot collide with anything that
+## already exists (a shipped id would otherwise be resolved to the shipped
+## level by Game.level_json_path()).
+func _pixel_level_id(path: String) -> String:
+	var raw := path.get_file().get_basename().to_lower()
+	var clean := ""
+	for i in raw.length():
+		var ch := raw[i]
+		if (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9"):
+			clean += ch
+		elif ch == "_" or ch == "-" or ch == " ":
+			clean += "_"
+	if clean == "" or not (clean[0] >= "a" and clean[0] <= "z"):
+		clean = "pixel_" + clean
+	clean = clean.substr(0, 48)
+	var candidate := clean
+	var n := 2
+	while BreakoutLevelWriter.find_json(candidate) != "":
+		candidate = "%s_%d" % [clean, n]
+		n += 1
+	return candidate
+
+
+func _open_pixel_import_dialog() -> void:
+	_open_import_dialog(0, 0, true)
+	_refresh("pick a pixel-art PNG — 1 pixel becomes 1 brick and grey walls turn solid")
 
 
 func _next_load_id() -> String:

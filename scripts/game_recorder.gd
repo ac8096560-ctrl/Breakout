@@ -92,6 +92,12 @@ var last_error := ""
 
 var _frames := 0
 var _captured := 0
+## The SLOT (wall clock / frame period) each captured picture was taken at. The
+## finaliser needs it to place the picture back on the real timeline: index-only
+## pacing silently re-times the take whenever the capture rate varies.
+var _slots: Array = []
+## Wall-clock marks of game events, taken while recording (see note_event).
+var _events := {}
 var _period_us := 33333
 var _start_us := 0
 # M-H: the frame writer. The main thread reads the viewport and hands the image
@@ -272,6 +278,15 @@ func is_busy() -> bool:
 	return state != STATE_IDLE
 
 
+## Mark a game event on the TAKE's clock (PART A). RecordSession calls this the
+## instant the race ends, so the finished file carries the moment the win
+## happened: the sync of the exported video can then be checked against the take
+## itself instead of guessed from the machine.
+func note_event(event: String) -> void:
+	if state == STATE_RECORDING:
+		_events[event] = recorded_seconds()
+
+
 ## Length of the video captured so far (captured frames / target FPS).
 func elapsed_seconds() -> float:
 	return float(_frames) / maxf(1.0, float(settings.get("fps", 30)))
@@ -415,6 +430,8 @@ func start(opts: Dictionary = {}) -> Dictionary:
 	_clean_stale_temps()
 	_frames = 0
 	_captured = 0
+	_slots = []
+	_events = {}
 	_cap_read_us = 0
 	_cap_enc_us = 0
 	_cap_wr_us = 0
@@ -514,6 +531,7 @@ func stop() -> Dictionary:
 		"render_frames": _render_frames, "cap_main_us": _cap_main_us, "overflow": _cap_overflow,
 		"mp4": _use_mp4, "wav": str(audio.get("path", "")) if bool(audio.get("ok", false)) else "",
 		"audio_seconds": float(audio.get("seconds", 0.0)), "audio_peak": float(audio.get("peak", 0.0)),
+		"slots": _slots.duplicate(), "events": _events.duplicate(),
 		"crf": crf_for(float(settings["quality"])), "note": _start_note,
 	}
 	_thread = Thread.new()
@@ -681,6 +699,7 @@ func _consume_frame(item: Dictionary) -> bool:
 	var slot := int(item.get("slot", 0))
 	if slot + 1 > _frames:
 		_frames = slot + 1
+	_slots.append(slot)
 	_cap_enc_us += enc_us
 	_cap_wr_us += Time.get_ticks_usec() - t_wr
 	return true
@@ -737,21 +756,24 @@ func _total_slots() -> int:
 	return maxi(_captured, int(round(recorded_seconds() * float(settings.get("fps", 30)))))
 
 
-## M-J: THE TIMELINE. Spread `count` distinct pictures evenly over `total`
-## output frames.
+## Brief 23 A — THE TIMELINE: every picture goes back where it was TAKEN.
 ##
-## M-H placed picture k at the slot it happened to be captured at, so every hold
-## was the length of that renderer interval. On this machine the render rate
-## swings from 8 to 40 FPS inside one race, which turns into holds of 1 to 12
-## frames (33 ms to 400 ms) — a random walk of short stutters and short freezes.
-## That irregularity, not the average rate, is what reads as "choppy" and
-## "pausing for fractions of a second".
+## M-J placed picture k at round(k * total / count), i.e. evenly in picture
+## INDEX, which is the real timeline only when the machine captures at a
+## constant rate. It does not: the render rate swings from 8 to 40 FPS inside
+## one race, so index pacing silently RE-TIMES the take. On a real take both
+## streams had the same total length (video 71.200 s, audio 71.200 s) and yet
+## the win popup sat 5.1 s away from the victory jingle, and the brick-break
+## sounds scattered +-3.7 s around their pictures: the picture clock itself was
+## bent. No audio correction can fix that from the outside — it would have to
+## bend the audio around a bent picture clock.
 ##
-## Placing picture k at round(k * total / count) gives every picture the same
-## number of frames (±1 from rounding), i.e. a steady cadence at the rate the
-## machine actually managed, while the total is EXACTLY `total` — the duration
-## still equals the wall-clock duration of the take, so the audio stays in sync.
-## Nothing is invented: the picture count is unchanged, only the spacing.
+## So each captured picture carries the slot it was taken at (`_slots`):
+## hold = the real gap to the next picture. A machine that keeps up (one picture
+## per slot) gets hold 1 everywhere, exactly like before; a machine that misses
+## slots holds the previous picture for the missed frames, which is what the eye
+## saw anyway. The sequence is still exactly `total` frames, so the file's
+## duration is still the take's wall-clock duration.
 ## How evenly the take was paced, for the result dictionary and the report:
 ## a hold of 12 frames next to a hold of 1 is what judder looks like in numbers.
 static func hold_stats(holds: Array) -> Dictionary:
@@ -774,6 +796,40 @@ static func hold_stats(holds: Array) -> Dictionary:
 		"jitter": snappedf(sqrt(var_sum / float(holds.size())), 0.001)}
 
 
+## The holds for `count` pictures laid out on the take's own slot clock, always
+## summing to exactly `total` frames. Falls back to even spacing only when there
+## is no slot data for these pictures.
+static func timeline_holds(slots: Array, count: int, total: int) -> Array:
+	var s: Array = slots
+	if s.size() > count:
+		s = s.slice(0, count)
+	if count > 0 and s.size() == count:
+		return slot_holds(s, total)
+	return pace_holds(count, total)
+
+
+static func slot_holds(slots: Array, total: int) -> Array:
+	var count := slots.size()
+	var out: Array = []
+	if count <= 0 or total <= 0:
+		return out
+	var prev := 0
+	for i in count:
+		# The next picture's slot is where this one stops being on screen; the
+		# last one runs to the end of the take.
+		var next_bound := total if i + 1 >= count else int(slots[i + 1])
+		# Leave at least one frame for every picture still to come.
+		var room := maxi(prev + 1, total - (count - 1 - i))
+		var cut := clampi(next_bound, prev + 1, room)
+		out.append(cut - prev)
+		prev = cut
+	# Any tail (slots that never arrived) belongs to the last picture.
+	if prev < total:
+		out[count - 1] = int(out[count - 1]) + (total - prev)
+	return out
+
+
+## Even spacing, only for a take with no slot data at all.
 static func pace_holds(count: int, total: int) -> Array:
 	var out: Array = []
 	if count <= 0:
@@ -840,7 +896,10 @@ func _finalize_thread(job: Dictionary) -> void:
 		"render_frames": int(job.get("render_frames", 0)),
 		"cap_main_ms": float(job.get("cap_main_us", 0)) / 1000.0,
 		"overflow": int(job.get("overflow", 0)),
-		"note": str(job.get("note", "")), "audio_seconds": float(job.get("audio_seconds", 0.0))}
+		"note": str(job.get("note", "")), "audio_seconds": float(job.get("audio_seconds", 0.0)),
+		# PART A evidence: the moment the win happened on the take's own clock, so
+		# the finished file can be checked against the game instead of a guess.
+		"sync_win_seconds": float((job.get("events", {}) as Dictionary).get("win", -1.0))}
 	# M-G: MP4 goes through the machine's encoder; AVI stays the built-in path.
 	if bool(job.get("mp4", false)):
 		_job_finish(_finalize_mp4(job, result))
@@ -857,7 +916,7 @@ func _finalize_thread(job: Dictionary) -> void:
 	# whole decode/resize/encode for every one of the `total` output frames, half
 	# of which were copies of the frame before.
 	var count := mini(int(job.get("captured", total)), total)
-	var holds := pace_holds(count, total)
+	var holds := timeline_holds(job.get("slots", []), count, total)
 	var written := 0
 	for i in count:
 		var p := frame_dir.path_join("%06d.jpg" % i)
@@ -939,6 +998,48 @@ func _finalize_thread(job: Dictionary) -> void:
 	_job_finish(result)
 
 
+## ------------------------------------------------------------ A/V sync (A)
+## THE TAKE'S OWN DRIFT, MEASURED — never a constant.
+##
+## The two streams are produced by two different clocks and the encoder used to
+## mux them as if they agreed:
+##   * the VIDEO is laid out on the recorder's slot clock (wall time,
+##     `_total_slots()` = captured/recorded seconds at the target FPS);
+##   * the AUDIO is whatever the audio thread actually mixed while the take
+##     ran. Under software rendering the mixer does not always get its full
+##     1/rate per second of wall time (it shares a CPU with llvmpipe), so the
+##     WAV covers LESS time than the video does.
+## Muxing those two unchanged is what a viewer hears as drift: every sound
+## arrives a little earlier than the picture, and the error grows across the
+## take (measured 0.12 s at the first brick -> 0.97 s at the win on the
+## reference take).
+##
+## The fix is to give both streams ONE time base at encode time: the ratio of
+## the take's own two lengths is exactly the factor the audio must be re-timed
+## by, so the audio ends where the video ends. It is computed per take from
+## that take's numbers, so a fast machine (ratio 1.000) is left completely
+## alone and a slow one is corrected by its own measured drift. A fixed atempo
+## constant could never do this.
+##
+## `audio_seconds` comes from the tap's own sample count (frames_written /
+## rate), and `video_seconds` from the frame count the file will hold, so this
+## measures the artifact that gets written, not a guess about the machine.
+const SYNC_TOLERANCE := 0.002   # 0.2 % = 120 ms in a minute: below this, nothing is touched
+const SYNC_ATEMPO_MIN := 0.5
+const SYNC_ATEMPO_MAX := 2.0
+
+
+## The factor to re-time the recorded audio by so it covers the video's length
+## exactly (1.0 = already in sync, leave it alone).
+static func audio_time_scale(audio_seconds: float, video_seconds: float) -> float:
+	if audio_seconds <= 0.0 or video_seconds <= 0.0:
+		return 1.0
+	var ratio := audio_seconds / video_seconds
+	if absf(ratio - 1.0) < SYNC_TOLERANCE:
+		return 1.0
+	return clampf(ratio, SYNC_ATEMPO_MIN, SYNC_ATEMPO_MAX)
+
+
 ## Quality setting -> H.264 CRF (lower is better). Constant quality keeps the
 ## flat game art clean without a bitrate to tune.
 func crf_for(quality: float) -> int:
@@ -967,7 +1068,7 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 	# `total` frames and ffmpeg still sees one image per output frame. Copying
 	# bytes costs no decode, which is why this is cheap even for minutes of take.
 	var count := mini(int(job.get("captured", total)), total)
-	var holds: Array = pace_holds(count, total)
+	var holds: Array = timeline_holds(job.get("slots", []), count, total)
 	var seq := frame_dir.path_join("seq")
 	if DirAccess.make_dir_recursive_absolute(seq) != OK and not DirAccess.dir_exists_absolute(seq):
 		result["err"] = "could not create the frame sequence folder: " + seq
@@ -988,6 +1089,15 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 			idx += 1
 	result["hold_stats"] = hold_stats(holds)
 	frame_dir = seq
+	# PART A: the take's own drift, measured on the two lengths the file will
+	# actually have, and handed to the encoder so the audio is re-timed onto the
+	# video's clock. Nothing is corrected when the take is already in sync.
+	var video_seconds := float(total) / maxf(0.001, fps)
+	var audio_seconds := float(job.get("audio_seconds", 0.0))
+	var atempo := audio_time_scale(audio_seconds, video_seconds)
+	result["sync_audio_seconds"] = audio_seconds
+	result["sync_video_seconds"] = video_seconds
+	result["sync_atempo"] = atempo
 	_mutex.lock()
 	_progress = int(total * 0.15)     # the transcode itself reports no progress
 	_mutex.unlock()
@@ -998,7 +1108,7 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 	var enc: Dictionary = VideoEncoder.encode_mp4({
 		"frame_dir": frame_dir, "frames": total, "fps": fps,
 		"width": w, "height": h, "out": out, "wav": wav,
-		"crf": int(job.get("crf", 20)),
+		"crf": int(job.get("crf", 20)), "atempo": atempo,
 	})
 	result["encode_ms"] = Time.get_ticks_msec() - t_enc
 	_mutex.lock()

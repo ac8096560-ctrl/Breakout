@@ -267,6 +267,10 @@ func _on_race_end(_payload: Variant = null) -> bool:
 		return false
 	if state != STATE_RECORDING:
 		return false
+	# PART A: stamp the end of the race on the take's own clock, so the exported
+	# file carries the instant the win happened. The A/V sync of the take is then
+	# measured against a fact from the game, not inferred afterwards.
+	GameRecorder.note_event("win" if (_payload is Dictionary and bool((_payload as Dictionary).get("won", false))) else "end")
 	_end_seen = true
 	if not auto_stop_enabled():
 		# the user asked to keep rolling: the take stays in "recording" until

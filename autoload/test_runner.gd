@@ -133,7 +133,7 @@ func _check_level_load() -> void:
 	# empty channel). Adding a level to Game.LEVELS automatically tests it.
 	var all_ok := true
 	var details: Array[String] = []
-	for level_id in Game.LEVELS:
+	for level_id in Game.SHIPPED_LEVELS:
 		var lv := BreakoutLevel.load_level("res://data/levels/%s.json" % level_id)
 		var ok := bool(lv.get("ok", false))
 		var detail := str(lv.get("err", ""))
@@ -152,10 +152,23 @@ func _check_level_load() -> void:
 			ok = int(lv["bricks"]) > 900 and int(lv["channel_cells"].size()) > 20 \
 				and int(lv["powerup_cells"].size()) == 2 and colours.size() >= 4 and channel_empty \
 				and int(lv["breakable"]) + int(lv["unbreakable"]) == int(lv["bricks"]) \
-				and int(lv["breakable"]) > 900
-			# level_02's solid border is 174 unbreakable cells, 1724 breakable
+				and int(lv["breakable"]) > 900 \
+				and int(lv["stranded_breakable"]) == 0
+			# Brief 23 B: level_02's GREY frame is solid without being listed — its
+			# 174 listed cells plus the 71 grey bricks in the picture's frame band
+			# (245 solid / 1653 breakable). The first version of this rule took the
+			# photo's whole grey BACKGROUND (670 cells, one edge-reaching region)
+			# and left 44 bricks unreachable: the level could not be won at all.
 			if level_id == "level_02_jensen":
-				ok = ok and int(lv["unbreakable"]) == 174 and int(lv["breakable"]) == 1724
+				ok = ok and int(lv["unbreakable"]) == 245 and int(lv["breakable"]) == 1653 \
+					and int(lv["unbreakable_from_list"]) == 174 \
+					and int(lv["unbreakable_from_grey"]) == 71
+			# ...and the rule must NOT touch the PORTRAIT: every solid cell of
+			# level_04 comes from its explicit list, none from the grey rule (its
+			# neutral pixels are skin and hair shading inside the picture).
+			if level_id == "level_04_ronaldo":
+				ok = ok and int(lv["unbreakable"]) == 994 \
+					and int(lv["unbreakable_from_grey"]) == 0
 			detail = "%s bricks=%d breakable=%d unbreakable=%d channel=%d colours=%d tips=%d" % [
 				level_id, int(lv["bricks"]), int(lv["breakable"]), int(lv["unbreakable"]),
 				int(lv["channel_cells"].size()), colours.size(),
@@ -176,7 +189,7 @@ func _check_level_load() -> void:
 func _check_apk_loader() -> void:
 	var all_ok := true
 	var details: Array[String] = []
-	for level_id in Game.LEVELS:
+	for level_id in Game.SHIPPED_LEVELS:
 		var json_path := BreakoutLevelWriter.find_json(level_id)
 		var lv := BreakoutLevel.load_level(json_path)
 		var ok := json_path != "" and bool(lv.get("ok", false))
@@ -1141,8 +1154,10 @@ func _suite_editor() -> void:
 	# --- a shipped level loads back into the editor: bricks + channel + border
 	var loaded: bool = ed.load_level_id("level_02_jensen")
 	var cnt: Dictionary = ed.counts()
+	# Brief 23 B: the editor PREVIEW must agree with the loader — its grey frame
+	# is solid (245 solid / 1653 breakable), not the old manual 174 / 1724.
 	var shipped_ok: bool = loaded and int(cnt["bricks"]) == 1898 \
-		and int(cnt["breakable"]) == 1724 and int(cnt["unbreakable"]) == 174 \
+		and int(cnt["breakable"]) == 1653 and int(cnt["unbreakable"]) == 245 \
 		and ed.is_channel_cell(Vector2i(20, 40)) and ed.is_border_solid()
 	_suite("editor_load_shipped", shipped_ok,
 		"bricks=%d breakable=%d unbreakable=%d channel_shown=%s border=%s" % [
@@ -1169,6 +1184,7 @@ func _suite_editor() -> void:
 		int(scene.bricks_left) if scene != null and scene.has_signal("game_ended") else -1])
 
 	await _check_editor_import(ed)
+	await _check_grey_frame()
 
 	await _report("WR_BREAKOUT_EDITOR_RESULT", _fails == 0, "failing suites: %d" % _fails)
 
@@ -1215,6 +1231,135 @@ func _check_editor_import(ed: Node) -> void:
 	_suite("editor_import_ronaldo_grid", big_ok,
 		"37x91 -> 80x100 ok=%s breakable=%d tiles=%d" % [
 			str(big_ok), int(lv80.get("breakable", 0)), int(lv80.get("bricks", 0))])
+
+	# --- BRIEF 23 D: DIRECT PIXEL-FILE IMPORT. One call takes a real level PNG
+	# (a shipped one, so the art is known-good) and must produce: 1 pixel = 1
+	# brick (80x100), the auto-solid grey rule applied, a written PNG + JSON
+	# pair, and the id registered for the menu. `keep=1` leaves the imported
+	# level on disk so a following --breakout-sim can prove it is winnable.
+	var keep := _args.has("keep=1")
+	var px: Dictionary = ed.import_pixel_file("res://data/levels/level_04_ronaldo.png")
+	var pid := str(px.get("id", ""))
+	var pjson := str(px.get("json", ""))
+	var plv: Dictionary = BreakoutLevel.load_level(pjson)
+	var png_ok := false
+	if str(px.get("png", "")) != "":
+		var pimg := BreakoutLevel.load_png_image(str(px["png"]))
+		png_ok = pimg != null and pimg.get_width() == 80 and pimg.get_height() == 100
+	var pixel_ok: bool = bool(px.get("ok", false)) and pid != "" \
+		and pid != "level_04_ronaldo" \
+		and int(px.get("cols", 0)) == 80 and int(px.get("rows", 0)) == 100 \
+		and png_ok and bool(plv.get("ok", false)) \
+		and int(plv.get("breakable", 0)) == int(px.get("breakable", -1)) \
+		and int(plv.get("unbreakable", 0)) == int(px.get("unbreakable", -1)) \
+		and Game.LEVELS.has(pid)
+	_suite("editor_import_pixel_file", pixel_ok,
+		"png -> id=%s %dx%d bricks=%d breakable=%d unbreakable=%d grey_solid=%d saved=%s in_menu=%s keep=%s" % [
+			pid, int(plv.get("cols", 0)), int(plv.get("rows", 0)),
+			int(plv.get("bricks", 0)), int(plv.get("breakable", 0)),
+			int(plv.get("unbreakable", 0)), int(plv.get("unbreakable_from_grey", 0)),
+			str(FileAccess.file_exists(pjson)), str(Game.LEVELS.has(pid)), str(keep)])
+	if keep and pid != "":
+		print("WR_BREAKOUT_PIXEL_KEPT id=%s json=%s" % [pid, pjson])
+	else:
+		# Leave nothing behind in the user's level folder.
+		for p in [pjson, str(px.get("png", ""))]:
+			if str(p) != "" and FileAccess.file_exists(str(p)):
+				DirAccess.remove_absolute(ProjectSettings.globalize_path(str(p)))
+
+	# --- leave the player's menu exactly as it was found. PLAY from the editor
+	# writes user://levels/editor_play_level, and Game.LEVELS lists that folder,
+	# so a suite run must remove its own artifacts instead of adding a level to
+	# the real menu.
+	for p in ["user://levels/editor_play_level.json", "user://levels/editor_play_level.png"]:
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
+	Game.refresh_levels()
+
+
+## Brief 23 B (follow-up) — A FRAME THAT A RESIZE LEFT IN PIECES.
+## The real Messi art is not in this repository, so this rebuilds the geometry
+## the brief describes and checks the RULE against it: an 80x100 portrait with a
+## closed grey frame around it (top bars + side walls forming a rectangle), the
+## frame broken into single-cell pieces the way a resize leaves it, neutral grey
+## SHADING inside the portrait that must stay breakable, and no manual
+## unbreakable_cells at all. The rule must wall in the frame and nothing else.
+func _check_grey_frame() -> void:
+	var dir := "user://breakout_grey_frame"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir))
+	var cols := 80
+	var rows := 100
+	var inset := 5
+	var img := Image.create(cols, rows, false, Image.FORMAT_RGBA8)
+	var shading: Array[Vector2i] = []
+	var frame_grey: Array[Vector2i] = []
+	for r in range(inset + 4, rows - inset - 5):
+		for c in range(inset + 3, cols - inset - 4):
+			img.set_pixel(c, r, Color8(198, 140, 110, 255))
+	for r in range(inset + 4, inset + 16):
+		for c in range(inset + 3, cols - inset - 4):
+			img.set_pixel(c, r, Color8(52, 34, 28, 255))
+	# Neutral shading inside the face: grey to the colour test, but it is picture
+	# content — exactly the case that must stay breakable.
+	for blob in [[30, 22, 8, 6], [46, 30, 10, 8], [60, 20, 6, 10]]:
+		for r in range(int(blob[0]), int(blob[0]) + int(blob[2])):
+			for c in range(int(blob[1]), int(blob[1]) + int(blob[3])):
+				img.set_pixel(c, r, Color8(120, 118, 116, 255))
+				shading.append(Vector2i(c, r))
+	# The closed frame. Every third cell is a resize-stained near-grey (chroma
+	# 30): lost to the colour test, which is the fragmentation the brief describes.
+	var ring: Array[Vector2i] = []
+	var top := inset
+	var bot := rows - inset - 1
+	var left := inset
+	var right := cols - inset - 1
+	for c in range(left, right + 1):
+		ring.append(Vector2i(c, top))
+		ring.append(Vector2i(c, bot))
+	for r in range(top + 1, bot):
+		ring.append(Vector2i(left, r))
+		ring.append(Vector2i(right, r))
+	for i in ring.size():
+		var cell: Vector2i = ring[i]
+		if i % 3 == 0:
+			img.set_pixel(cell.x, cell.y, Color8(150, 142, 120, 255))
+		else:
+			img.set_pixel(cell.x, cell.y, Color8(128, 128, 128, 255))
+			frame_grey.append(cell)
+	img.save_png(ProjectSettings.globalize_path(dir.path_join("messi_frame.png")))
+	var meta := {"id": "test_grey_frame", "display_name": "GREY FRAME",
+		"image": "messi_frame.png", "cols": cols, "rows": rows, "cell": 6.0,
+		"origin": [30, 74], "unbreakable_cells": []}
+	var json_path := ProjectSettings.globalize_path(dir.path_join("messi_frame.json"))
+	var f := FileAccess.open(json_path, FileAccess.WRITE)
+	f.store_string(JSON.stringify(meta))
+	f.close()
+	var lv := BreakoutLevel.load_level(dir.path_join("messi_frame.json"))
+	var solid := {}
+	for u in lv.get("unbreakable_cells", []):
+		solid[u] = true
+	var covered := 0
+	for cell in frame_grey:
+		if solid.has(cell):
+			covered += 1
+	var shading_solid := 0
+	for cell in shading:
+		if solid.has(cell):
+			shading_solid += 1
+	# The carve always opens the channel through the frame's bottom bar, so a few
+	# frame cells legitimately stop being bricks.
+	var ok: bool = bool(lv.get("ok", false)) and covered >= frame_grey.size() - 4 \
+		and shading_solid == 0 and int(lv.get("stranded_breakable", -1)) == 0
+	_suite("editor_grey_frame", ok,
+		"frame_cells=%d frame_grey=%d covered=%d (%d%%) shading_grey=%d shading_solid=%d grey_solid=%d stranded=%d unstained_out_of_reach=%d" % [
+			ring.size(), frame_grey.size(), covered,
+			int(100.0 * float(covered) / maxf(1.0, float(frame_grey.size()))),
+			shading.size(), shading_solid, int(lv.get("unbreakable_from_grey", 0)),
+			int(lv.get("stranded_breakable", -1)), ring.size() - frame_grey.size()])
+	for name in ["messi_frame.png", "messi_frame.json"]:
+		var p := ProjectSettings.globalize_path(dir.path_join(name))
+		if FileAccess.file_exists(p):
+			DirAccess.remove_absolute(p)
 
 
 # ------------------------------------------------------------------ smoke
@@ -1447,5 +1592,30 @@ func _suite_record() -> void:
 	print("WR_BREAKOUT_RECORD path=%s frames=%d size=%dx%d fps=%d format=%s" % [
 		str(res.get("path", "")), int(res.get("frames", 0)), int(res.get("width", 0)),
 		int(res.get("height", 0)), int(res.get("fps", 0)), str(res.get("format", ""))])
+	# The two timelines the take was built from, so a sync problem can be read
+	# off the take instead of guessed at: how many seconds of wall clock the
+	# recording covered, how many seconds of audio the tap produced, and how
+	# fast the machine actually rendered/captured.
+	print("WR_BREAKOUT_RECORD_TIMING real_seconds=%.3f audio_seconds=%.3f sync_delta=%+.3f captured=%d render_fps=%.2f capture_fps=%.2f dup_frames=%d duration=%.3f" % [
+		float(res.get("real_seconds", 0.0)), float(res.get("audio_seconds", 0.0)),
+		float(res.get("sync_delta", 0.0)), int(res.get("captured", 0)),
+		float(res.get("render_fps", 0.0)), float(res.get("capture_fps", 0.0)),
+		int(res.get("dup_frames", 0)), float(res.get("duration", 0.0))])
+	# The A/V sync correction this take got, and the outcome it recorded, so a
+	# report never has to guess either one.
+	print("WR_BREAKOUT_RECORD_SYNC audio_seconds=%.3f video_seconds=%.3f atempo=%.6f residual=%.3f win_wall=%.3f" % [
+		float(res.get("sync_audio_seconds", 0.0)), float(res.get("sync_video_seconds", 0.0)),
+		float(res.get("sync_atempo", 1.0)),
+		float(res.get("sync_audio_seconds", 0.0)) / maxf(0.0001, float(res.get("sync_atempo", 1.0))) \
+			- float(res.get("sync_video_seconds", 0.0)),
+		float(res.get("sync_win_seconds", -1.0))])
+	# The take restarted the race, so the scene that was on screen when it began
+	# is gone: read the outcome from the LIVE scene instead.
+	var live: Node = get_tree().current_scene
+	if live != null and is_instance_valid(live) and live.has_signal("game_ended"):
+		print("WR_BREAKOUT_RECORD_GAME state=%s elapsed=%.1f score=%d stars=%d bricks_left=%d won=%s" % [
+			str(live.get("state")), float(live.get("elapsed")), int(live.get("score")),
+			int(live.get("stars_collected")), int(live.get("bricks_left")),
+			str(str(live.get("state")) == "level_clear")])
 	await _report("WR_BREAKOUT_RECORD_RESULT", ok,
 		"take saved" if ok else "recording failed: %s" % str(RecordSession.last_error))

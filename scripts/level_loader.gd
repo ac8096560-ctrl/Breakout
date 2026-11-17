@@ -25,6 +25,29 @@ const DEFAULT_ROWS := 50
 const DEFAULT_CELL := 12.0
 const DEFAULT_ORIGIN := Vector2(30, 74)
 
+## --- AUTO-SOLID GREY (no more manual marking) ---------------------------
+## Level art draws its walls and frame in GREY. Choubey paints levels as pixel
+## art, so a grey brick is SOLID without being listed in the JSON: neutral
+## colour (the three channels nearly equal) at mid brightness.
+##
+## Colour alone is not enough, and the shipped art proves it: level_04_ronaldo
+## has 302 neutral, mid-bright bricks that are the PORTRAIT's own skin and hair
+## shading ((151,140,138), (100,83,76) ...), which must stay breakable. What
+## separates a FRAME from picture content is POSITION, not colour: a frame is the
+## outermost ring of the picture, shading and backgrounds are inside it. So the
+## rule is "neutral + mid-bright + inside the picture's frame band" — see
+## grey_frame_cells() for why the band is measured per cell instead of by grey
+## region connectivity, and why it is only GREY_FRAME_BAND cells deep.
+##
+## The explicit `unbreakable_cells` list keeps working; the final solid set is
+## the UNION of that list and this rule.
+const GREY_CHROMA := 25.0          # max(R,G,B) - min(R,G,B) in 0..255 steps
+const GREY_MIN_BRIGHTNESS := 60.0  # (R+G+B)/3, 0..255: below this is black art
+const GREY_MAX_BRIGHTNESS := 200.0 # above this is a highlight, not a wall
+## How deep the frame band is, in cells, measured from the picture's outer edge.
+## 2 covers a 1-cell frame and one cell of resize ringing around it.
+const GREY_FRAME_BAND := 2
+
 
 ## Load a level. Returns
 ##   {ok, err, id, name, topic, cols, rows, cell, origin, image,
@@ -123,17 +146,30 @@ static func load_level(json_path: String) -> Dictionary:
 		if (cell_col as Color).a >= 0.5:
 			bricks += 1
 
-	# --- unbreakable cells: the solid border ring (walls, not bricks). They
-	# are listed explicitly in the JSON (never a magic colour) and are only
-	# kept when they are still bricks after the channel carve — a carved-out
-	# cell (the stem gap) is an entry, not a wall.
-	var unbreakable: Array[Vector2i] = []
+	# --- unbreakable cells: walls, not bricks. Two sources, ONE final set:
+	#   * the explicit `unbreakable_cells` list (still honoured exactly as
+	#     before), and
+	#   * the AUTO-SOLID GREY rule — every grey frame/wall brick (see the
+	#     constants above for why the colour test is paired with the
+	#     "reaches the outer edge" test).
+	# A listed cell the channel carved out (the stem gap) is an entry, not a
+	# wall, so it is still dropped here.
+	var listed: Array[Vector2i] = []
 	for u in d.get("unbreakable_cells", []):
 		if not (u is Array) or (u as Array).size() != 2:
 			continue
 		var cellp := Vector2i(int(u[0]), int(u[1]))
-		if _is_brick(grid, cols, rows, cellp) and not unbreakable.has(cellp):
-			unbreakable.append(cellp)
+		if _is_brick(grid, cols, rows, cellp) and not listed.has(cellp):
+			listed.append(cellp)
+	var grey_solid := grey_frame_cells(grid, cols, rows)
+	var unbreakable := solid_cells(grid, cols, rows, listed)
+	# "How many came from the grey rule": the cells that would have been
+	# BREAKABLE without it (a cell the JSON already listed is not its doing).
+	var from_grey := 0
+	for g in grey_solid:
+		if not listed.has(g):
+			from_grey += 1
+	var stranded := stranded_breakable(grid, cols, rows, unbreakable, channel_cells)
 
 	var origin := DEFAULT_ORIGIN
 	if d.has("origin") and d["origin"] is Array and (d["origin"] as Array).size() == 2:
@@ -155,6 +191,9 @@ static func load_level(json_path: String) -> Dictionary:
 		"bricks": bricks,
 		"unbreakable_cells": unbreakable,
 		"unbreakable": unbreakable.size(),
+		"unbreakable_from_list": listed.size(),
+		"unbreakable_from_grey": from_grey,
+		"stranded_breakable": stranded,
 		"breakable": bricks - unbreakable.size(),
 	}
 
@@ -247,6 +286,125 @@ static func carve_channel(grid: Array, cols: int, rows: int, spec: Dictionary) -
 		var tip := Vector2i(int(a[0]), int(a[1]))
 		_carve_line(grid, cols, rows, fork, tip, out, arm_w)
 	return out
+
+
+## Is this brick colour a WALL grey? Neutral (channels nearly equal) and mid
+## bright. Black (empty / channel / dark art) is excluded by the brightness
+## floor; a coloured portrait pixel is excluded by the chroma ceiling.
+static func is_grey(col: Color) -> bool:
+	var hi := maxf(col.r, maxf(col.g, col.b)) * 255.0
+	var lo := minf(col.r, minf(col.g, col.b)) * 255.0
+	if hi - lo >= GREY_CHROMA:
+		return false
+	var bright := (col.r + col.g + col.b) / 3.0 * 255.0
+	return bright >= GREY_MIN_BRIGHTNESS and bright <= GREY_MAX_BRIGHTNESS
+
+
+static func _is_grey_brick(grid: Array, cols: int, rows: int, cell: Vector2i) -> bool:
+	return _is_brick(grid, cols, rows, cell) and is_grey(grid[cell.y * cols + cell.x])
+
+
+## Every grey brick in the picture's FRAME BAND: within GREY_FRAME_BAND cells of
+## the picture's outer edge (the bounding box of its bricks, so an imported
+## portrait with a transparent margin is framed from ITS edge, not the grid's).
+##
+## Two measured facts shape this, and each one broke a simpler rule:
+##
+## 1. A FRAME IS OFTEN FRAGMENTED. Frame art redrawn at another size does not stay
+##    one connected grey region: a resize leaves it in single-cell pieces (a
+##    Messi-style 80x100 frame arrived as 63 separate regions). Asking a grey
+##    REGION to connect to the edge therefore found only 85 of that frame's
+##    ~292 cells — the rest stayed breakable, so the frame had to be marked by
+##    hand, which is exactly what this rule exists to avoid. Distance from the
+##    edge does not care about connectivity, so a fragmented frame is covered
+##    piece by piece.
+##
+## 2. NOT EVERY EDGE-REACHING GREY IS A FRAME. level_02_jensen's photo has a grey
+##    BACKGROUND: 670 grey bricks in ONE region that does reach the picture's
+##    edge. It is picture content, not a wall. Making it solid walled the
+##    portrait in and left 44 bricks unreachable — the level could no longer be
+##    won. That background starts one cell inside the picture's own border, while
+##    a frame IS the border, so a band a couple of cells deep takes the frame and
+##    leaves the background (and every photo's interior shading) breakable.
+static func grey_frame_cells(grid: Array, cols: int, rows: int) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var min_c := cols
+	var max_c := -1
+	var min_r := rows
+	var max_r := -1
+	for r in rows:
+		for c in cols:
+			if _is_brick(grid, cols, rows, Vector2i(c, r)):
+				min_c = mini(min_c, c)
+				max_c = maxi(max_c, c)
+				min_r = mini(min_r, r)
+				max_r = maxi(max_r, r)
+	if max_c < 0:
+		return out
+	for r in range(min_r, max_r + 1):
+		for c in range(min_c, max_c + 1):
+			var cell := Vector2i(c, r)
+			if not _is_grey_brick(grid, cols, rows, cell):
+				continue
+			var depth := mini(mini(c - min_c, max_c - c), mini(r - min_r, max_r - r))
+			if depth < GREY_FRAME_BAND:
+				out.append(cell)
+	return out
+
+
+## THE FINAL SOLID SET: the level's explicit list UNION the auto-solid greys.
+static func solid_cells(grid: Array, cols: int, rows: int, listed: Array) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	for u in listed:
+		if not (u is Vector2i):
+			continue
+		var cell: Vector2i = u
+		if _is_brick(grid, cols, rows, cell) and not out.has(cell):
+			out.append(cell)
+	for g in grey_frame_cells(grid, cols, rows):
+		if not out.has(g):
+			out.append(g)
+	return out
+
+
+## THE DESIGN RULE A WALL MUST NEVER BREAK: a solid cell is a wall the ball can
+## never break, so a breakable brick that no path of empty-or-breakable cells
+## reaches from the ball's own channel can never be broken — and a level with
+## one can never be cleared. Returns how many such bricks a solid set creates
+## (0 for every shipped level; the loader reports it and the tests assert it).
+## This is the check that would have caught the grey-background regression by
+## itself instead of in a 120-second sim.
+static func stranded_breakable(grid: Array, cols: int, rows: int,
+		solid: Array[Vector2i], from: Array[Vector2i]) -> int:
+	var solid_set := {}
+	for s in solid:
+		solid_set[s] = true
+	var seen := {}
+	var stack: Array[Vector2i] = []
+	for f in from:
+		if not solid_set.has(f) and not seen.has(f):
+			seen[f] = true
+			stack.append(f)
+	while not stack.is_empty():
+		var cell: Vector2i = stack.pop_back()
+		for step in FOUR_WAY:
+			var nxt: Vector2i = cell + (step as Vector2i)
+			if nxt.x < 0 or nxt.y < 0 or nxt.x >= cols or nxt.y >= rows:
+				continue
+			if seen.has(nxt) or solid_set.has(nxt):
+				continue
+			seen[nxt] = true
+			stack.append(nxt)
+	var stranded := 0
+	for r in rows:
+		for c in cols:
+			var cell := Vector2i(c, r)
+			if _is_brick(grid, cols, rows, cell) and not solid_set.has(cell) and not seen.has(cell):
+				stranded += 1
+	return stranded
+
+
+const FOUR_WAY := [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 
 
 static func _is_brick(grid: Array, cols: int, rows: int, cell: Vector2i) -> bool:

@@ -73,6 +73,19 @@ func start(wav_path: String) -> bool:
 
 ## Pull everything the tap has buffered into the WAV. Called once per rendered
 ## frame; the effect only holds ~2 s, so a stall is the only way to lose audio.
+##
+## WHY THIS APPENDS INSTEAD OF RE-TIMING EACH BLOCK (brief 23 A, measured):
+## the mixer's OUTPUT is already real time — a 71.6 s take of a machine running
+## at 7.5 FPS held 71.6 s of continuous audio, and the taps of two takes agreed
+## with the wall clock to 50 ms. What varies is only how the frames are
+## DELIVERED: a slow frame hands over a double-length block, the next a short
+## one, and they cancel out. Re-timing each block to its own slice of the clock
+## therefore turned delivery jitter into pitch swings of up to 2.8x (measured:
+## block stretch 0.36..2.80), which mangles the waveforms — the victory jingle
+## stopped matching its own recording. So the samples are written in the order
+## the mixer produced them, and the ONE thing that is a real clock difference,
+## the take's total audio length against its video length, is measured and
+## corrected once, at encode time (game_recorder.audio_time_scale).
 func drain() -> void:
 	if not ok or _file == null or _capture == null:
 		return
@@ -87,10 +100,8 @@ func drain() -> void:
 	var o := 0
 	for i in buf.size():
 		var v: Vector2 = buf[i]
-		var l := int(clampf(v.x, -1.0, 1.0) * 32767.0)
-		var r := int(clampf(v.y, -1.0, 1.0) * 32767.0)
-		pcm.encode_s16(o, l)
-		pcm.encode_s16(o + 2, r)
+		pcm.encode_s16(o, int(clampf(v.x, -1.0, 1.0) * 32767.0))
+		pcm.encode_s16(o + 2, int(clampf(v.y, -1.0, 1.0) * 32767.0))
 		o += 4
 		var a := maxf(absf(v.x), absf(v.y))
 		if a > _peak:
@@ -130,6 +141,7 @@ func stop() -> Dictionary:
 	_patch_header(data_bytes)
 	var res := {"ok": frames_written > 0, "path": path, "seconds": seconds(),
 		"rate": rate, "channels": channels, "bytes": data_bytes, "peak": _peak,
+		"dropped_blocks": dropped_blocks,
 		"err": "" if frames_written > 0 else "no audio was captured"}
 	if not res["ok"]:
 		# Never hand a zero-length WAV to the encoder.

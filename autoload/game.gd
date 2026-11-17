@@ -3,7 +3,11 @@ extends Node
 ## whether the paddle auto-plays, and the scene changes. This is the Breakout
 ## equivalent of WorldRace's Game autoload, with no race concepts in it.
 
-const LEVELS := ["level_01_portrait", "level_02_jensen", "level_03_solid_path", "level_04_ronaldo"]
+## The levels that ship with the game. LEVELS is what the MENU actually offers:
+## the shipped ids plus anything an editor import saved into user://levels, so
+## an imported level is playable from the menu without a restart (brief 23 D).
+const SHIPPED_LEVELS := ["level_01_portrait", "level_02_jensen", "level_03_solid_path", "level_04_ronaldo"]
+var LEVELS: Array = SHIPPED_LEVELS.duplicate()
 const SEED_OPTIONS := [1, 2, 3, 7, 42]
 const THEME_ID := "rose"
 
@@ -28,6 +32,22 @@ var editor_return := false
 ## The editor's in-memory state, kept across the scene change so PLAY -> back
 ## returns to the same level instead of an empty grid.
 var editor_snapshot: Dictionary = {}
+
+
+func _ready() -> void:
+	refresh_levels()
+
+
+## Rebuild LEVELS: shipped levels first (the menu's default order), then every
+## level the editor saved to user://levels. Safe to call at any time; the menu
+## re-reads it on the next tap.
+func refresh_levels() -> void:
+	var next: Array = SHIPPED_LEVELS.duplicate()
+	for id in BreakoutLevelWriter.find_all():
+		if not next.has(id):
+			next.append(id)
+	LEVELS = next
+	menu_level_idx = posmod(menu_level_idx, maxi(1, LEVELS.size()))
 
 
 func resolve_seed() -> int:
