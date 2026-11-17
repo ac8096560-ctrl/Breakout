@@ -276,6 +276,9 @@ func _load_level() -> void:
 		_tip_cells.append(t)
 	for u in level["unbreakable_cells"]:
 		_unbreakable_cells.append(u)
+	_channel_set = {}
+	for ch in level["channel_cells"]:
+		_channel_set[ch] = true
 	field.configure(cols, rows, cell, origin, pal, grid)
 	field.queue_redraw()
 	_spawn_brick_bodies()
@@ -290,7 +293,7 @@ func _spawn_brick_bodies() -> void:
 			var b := Brick.new()
 			b.name = "Brick_%d_%d" % [c, r]
 			bricks_root.add_child(b)
-			b.setup(Vector2i(c, r), cell_center(Vector2i(c, r)))
+			b.setup(Vector2i(c, r), cell_center(Vector2i(c, r)), cell)
 			b.unbreakable = _unbreakable_cells.has(Vector2i(c, r))
 			_bodies[Vector2i(c, r)] = b
 
@@ -455,9 +458,10 @@ func _update_paddle(delta: float) -> void:
 		paddle.move_to_x(lerpf(paddle.position.x, _player_target, minf(1.0, delta * 26.0)))
 
 
-## Auto-play: track the LOWEST ball (the one nearest the danger line) and lead
-## it a little when it is falling. This is the recording mode — a Short is
-## watchable with no input at all.
+## Auto-play: track the LOWEST ball (the one nearest the danger line), predict
+## where it will cross the paddle line, and (Stage D) PLACE THE PADDLE OFF
+## CENTRE so the ball leaves at a chosen angle. This is the recording mode — a
+## Short is watchable with no input at all.
 func _auto_target() -> float:
 	# 1) FIRST the ball that will reach the paddle line soonest — that is the
 	# one about to be lost. Predicting the arrival x (not the current x) is
@@ -471,9 +475,19 @@ func _auto_target() -> float:
 		if eta < best_eta:
 			best_eta = eta
 			best = b
-	if best != null and best_eta < 0.85:
-		return _lead_x(best)
-	# 2) No ball is in danger for a moment: chase the lowest falling power-up,
+	# 2) A ball is about to arrive: AIM it. The paddle stands at
+	# `arrival - rel * half_width`, so the ball lands `rel * half_width` away
+	# from the paddle centre and leaves at `rel * MAX_BOUNCE_DEG` degrees.
+	# |rel| <= AIM_REL_MAX keeps the contact point well inside the 104 px face,
+	# so the ball is still caught — aiming never trades a save for an angle.
+	if best != null and best_eta < AIM_WINDOW:
+		var arrival := _predict_arrival(best)
+		if best != _aim_ball or absf(arrival - _aim_arrival) > AIM_REPLAN_PX:
+			_aim_ball = best
+			_aim_arrival = arrival
+			_aim_rel = _plan_aim_rel(arrival)
+		return arrival - _aim_rel * Paddle.SIZE.x * 0.5
+	# 3) No ball is arriving for a moment: chase the lowest falling power-up,
 	# which is what keeps a multi-ball take alive (and is why a recorded take
 	# reaches the reference's ball counts).
 	var pick: PowerUp = null
@@ -494,12 +508,230 @@ func _auto_target() -> float:
 	return paddle.position.x
 
 
+## The x where a falling ball crosses the paddle line, WITH the side walls
+## folded in: a return that reaches x=560 arrives back at x=520, not at 560.
+## (The old version clamped instead, which mis-placed the paddle on wide
+## returns and is what the aiming needs to be exact.)
 func _lead_x(b: Ball) -> float:
 	var x := b.position.x
 	if b.vel.y > 1.0:
-		var eta := clampf((paddle.position.y - b.position.y) / float(b.vel.y), 0.0, 1.5)
+		var eta := clampf((paddle.position.y - b.position.y) / float(b.vel.y), 0.0, 2.0)
 		x += float(b.vel.x) * eta
+	x = _fold_x(x)
 	return clampf(x, Paddle.SIZE.x * 0.5, VIEW.x - Paddle.SIZE.x * 0.5)
+
+
+## Where the ball will actually cross the paddle line: the ball is marched DOWN
+## through the level's own grid, so the corridor walls a descending ball is
+## rattling between are taken into account instead of being ignored. A straight
+## line prediction is what left the old paddle ~10 px off inside a 24 px
+## corridor, which is the difference between catching and aiming.
+func _predict_arrival(b: Ball) -> float:
+	if b.vel.y <= 1.0:
+		return _lead_x(b)
+	var p := b.position
+	var d := b.vel.normalized()
+	var guard := 0
+	var paddle_line := paddle.position.y - Paddle.SIZE.y * 0.5
+	while p.y < paddle_line and guard < 700:
+		guard += 1
+		var next := p + d * AIM_STEP
+		if next.x < Ball.RADIUS or next.x > VIEW.x - Ball.RADIUS:
+			d.x = -d.x
+			next = p + d * AIM_STEP
+		var cell := _cell_at(next)
+		if cell.x >= 0 and cell.y >= 0 and cell.x < cols and cell.y < rows \
+				and _cell_solid(cell):
+			if _unbreakable_cells.has(cell):
+				if _cell_at(p).x != cell.x:
+					d.x = -d.x
+				else:
+					d.y = -d.y
+				next = p + d * AIM_STEP
+			else:
+				break          # a breakable brick ends the fall: it never arrives
+		p = next
+	return _fold_x(p.x)
+
+
+## Reflect an x off the two side walls (the ball's centre can only live in
+## [RADIUS, VIEW.x - RADIUS]).
+func _fold_x(x: float) -> float:
+	var lo := Ball.RADIUS
+	var hi := VIEW.x - Ball.RADIUS
+	var span := hi - lo
+	if span <= 0.0:
+		return lo
+	var t := fposmod(x - lo, span * 2.0)
+	return lo + (t if t <= span else span * 2.0 - t)
+
+
+# ------------------------------------------- Stage D: the aiming auto-play
+## The AI used to centre the paddle, which returns the ball at ~0 deg. A
+## corridor needs an ANGLED return: the hit position on the 104 px paddle maps
+## linearly to the bounce angle (-62..+62 deg, Paddle.bounce_for), so the AI can
+## pick any heading up to ~50 deg by standing off centre.
+##
+## The heading is chosen by RAY-SIMULATING the ball forward from the paddle face
+## over the level's own brick grid: a 3-degree sweep of candidate angles, a
+## handful of wall and brick bounces each, and the angle that reaches the most
+## BREAKABLE bricks soonest wins. Unbreakable walls (a corridor's grey walls)
+## reflect instead of breaking, so a shot that just rattles around a dead end
+## scores nothing and is rejected, while a shot that turns a corner and reaches
+## the portrait scores.
+## The search is deterministic (fixed candidate list, no rng) and only reads
+## state the game already has, so a seeded take stays reproducible.
+const AIM_WINDOW := 1.2         # seconds before the ball arrives that aiming runs
+const AIM_REPLAN_PX := 6.0      # replan when the predicted arrival moved this far
+## 0.8 of the face = ~50 deg. Keeping 10 px of face spare means a prediction
+## that is a few px out still catches the ball.
+const AIM_REL_MAX := 0.8
+## Sweep the whole range in 3 deg steps. A corridor's periodic zig-zag makes a
+## shot very sensitive to its angle (the winding fixture goes through its 24 px
+## mouth at 12 deg but misses it at 9 or 18), so a coarse 10 deg sweep is not
+## enough; the finer one costs nothing because the short probe stops after a
+## handful of bounces.
+const AIM_MIN_DEG := -48.0
+const AIM_STEP_DEG := 3.0
+const AIM_BOUNCES := 6          # short probe: bricks reachable straight away
+## A winding corridor rattle costs one bounce per wall crossing, so the deep
+## pass needs a much larger budget than the short probe (the fixture's path is
+## ~1500 px and ~45 crossings, so 260 is comfortable).
+const AIM_BOUNCES_DEEP := 260   # second pass when the short probe sees nothing
+const AIM_STEP := 3.0           # ray-march step in px (a cell is 12 px)
+const AIM_MAX_STEPS := 4200     # ~12,600 px of simulated travel, hard cap
+const AIM_HIT_SCORE := 100.0
+const AIM_HIT_DECAY := 11.0     # a brick hit later in the path is worth less
+const AIM_EFFORT := 0.02        # break ties towards the straighter shot
+## Steering into the level's OWN carved channel is worth something even when no
+## brick is reachable from the paddle line: a corridor level can seal the field
+## behind solid walls (level_04's portrait frame), and the channel is then the
+## only way back in. `--breakout-sim level=ref_winding_track` is the same case.
+const AIM_CHANNEL_BONUS := 40.0
+## Inner face of the top play-field wall (centre 64, 20 px tall) plus the ball.
+const AIM_TOP_Y := 78.0
+
+var _aim_ball: Ball = null
+var _aim_arrival := 0.0
+var _aim_rel := 0.0
+## The carved channel, as a set, for the aim planner (see AIM_CHANNEL_BONUS).
+var _channel_set: Dictionary = {}
+
+
+## Relative hit position (-1..1) that sends the ball at the best heading from
+## `arrival_x`. Pure: same grid + same arrival -> same answer.
+func _plan_aim_rel(arrival_x: float) -> float:
+	var from := Vector2(clampf(arrival_x, Ball.RADIUS, VIEW.x - Ball.RADIUS),
+		paddle.position.y - Paddle.SIZE.y * 0.5 - Ball.RADIUS)
+	var best := -1.0e9
+	var best_rel := 0.0
+	for a in _aim_angles():
+		var dir := Vector2(sin(deg_to_rad(a)), -cos(deg_to_rad(a)))
+		var score := float(_aim_score(from, dir, AIM_BOUNCES)["score"]) - absf(a) * AIM_EFFORT
+		if score > best:
+			best = score
+			best_rel = a / Paddle.MAX_BOUNCE_DEG
+	if best < 1.0:
+		# Nothing breakable within the short probe (a corridor's far end, an
+		# already cleared area): look much further before settling for
+		# straight up, so a winding level can still be steered into its turns.
+		for a in _aim_angles():
+			var dir := Vector2(sin(deg_to_rad(a)), -cos(deg_to_rad(a)))
+			var score := float(_aim_score(from, dir, AIM_BOUNCES_DEEP)["score"]) - absf(a) * AIM_EFFORT
+			if score > best:
+				best = score
+				best_rel = a / Paddle.MAX_BOUNCE_DEG
+	if best < 1.0:
+		# Still nothing: the field is walled off and the level's carved channel
+		# is the only way in (level_04's portrait frame). Aim so the ball comes
+		# BACK to the paddle line on top of the channel's stem, which is the only
+		# place a straight return can enter the corridor from.
+		var stem := _stem_centre_x()
+		var best_setup := -1.0e9
+		for a in _aim_angles():
+			var dir := Vector2(sin(deg_to_rad(a)), -cos(deg_to_rad(a)))
+			var res := _aim_score(from, dir, AIM_BOUNCES_DEEP)
+			var end_x := float(res["end_x"])
+			if end_x < 0.0:
+				continue
+			var score := -absf(end_x - stem) - absf(a) * AIM_EFFORT
+			if score > best_setup:
+				best_setup = score
+				best_rel = a / Paddle.MAX_BOUNCE_DEG
+	return clampf(best_rel, -AIM_REL_MAX, AIM_REL_MAX)
+
+
+## Candidate bounce angles, symmetric around straight up, clamped to the range
+## the paddle can actually produce (AIM_REL_MAX * MAX_BOUNCE_DEG).
+func _aim_angles() -> Array:
+	var out: Array = []
+	var limit := AIM_REL_MAX * Paddle.MAX_BOUNCE_DEG
+	var a := AIM_MIN_DEG
+	while a <= limit + 0.001:
+		out.append(a)
+		a += AIM_STEP_DEG
+	return out
+
+
+## Score one candidate heading: march the ball through the grid, breaking what
+## is breakable (a broken cell is passed through, like the real ball) and
+## reflecting off the walls, and pay out for every distinct breakable brick.
+## Returns {score, end_x}: end_x is where the simulated ball comes back to the
+## paddle line (-1 when the march ran out of budget), which the corridor-entry
+## pass below uses to line the NEXT return up with the level's stem.
+func _aim_score(from: Vector2, dir: Vector2, max_bounces: int) -> Dictionary:
+	var p := from
+	var d := dir
+	var score := 0.0
+	var hits := 0
+	var bounces := 0
+	var steps := 0
+	var broken := {}
+	var in_channel := false
+	var came_back := false
+	var paddle_line := paddle.position.y - Paddle.SIZE.y * 0.5
+	while bounces < max_bounces and steps < AIM_MAX_STEPS:
+		steps += 1
+		var next := p + d * AIM_STEP
+		if next.x < Ball.RADIUS or next.x > VIEW.x - Ball.RADIUS:
+			d.x = -d.x
+			next = p + d * AIM_STEP
+		if next.y < AIM_TOP_Y:
+			d.y = -d.y
+			next = p + d * AIM_STEP
+		if next.y > paddle_line:
+			came_back = true
+			break
+		var cell := _cell_at(next)
+		if cell.x >= 0 and cell.y >= 0 and cell.x < cols and cell.y < rows \
+				and not broken.has(cell) and _cell_solid(cell):
+			if _unbreakable_cells.has(cell):
+				bounces += 1
+				if _cell_at(p).x != cell.x:
+					d.x = -d.x
+				else:
+					d.y = -d.y
+				next = p + d * AIM_STEP
+			else:
+				broken[cell] = true
+				hits += 1
+				score += maxf(0.0, AIM_HIT_SCORE - AIM_HIT_DECAY * float(hits - 1))
+		elif _channel_set.has(cell):
+			in_channel = true
+		p = next
+	if in_channel:
+		score += AIM_CHANNEL_BONUS
+	return {"score": score, "end_x": _fold_x(p.x) if came_back else -1.0}
+
+
+func _cell_at(p: Vector2) -> Vector2i:
+	return Vector2i(floori((p.x - origin.x) / cell), floori((p.y - origin.y) / cell))
+
+
+func _cell_solid(c: Vector2i) -> bool:
+	if c.y < 0 or c.y >= rows or c.x < 0 or c.x >= cols:
+		return false
+	return (grid[c.y * cols + c.x] as Color).a >= 0.5
 
 
 func _input(event: InputEvent) -> void:
