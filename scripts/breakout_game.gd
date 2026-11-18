@@ -22,10 +22,15 @@ const STATE_LEVEL_CLEAR := "level_clear"
 const STATE_GAME_OVER := "game_over"
 
 const VIEW := Vector2(540, 960)
-## 76% of the frame, like the reference (paddle top at 488/640). With the grid
-## ending at 664 the return trip is short, which is what makes the brick rate
-## of the reference reachable.
-const PADDLE_Y := 760.0
+## Brief 25 LAYOUT (follow-up 2): the paddle sits LOWER than the reference's
+## 76%, so there is clearly more room between the portrait's bottom edge and the
+## bar that has to catch the ball. The field now ends at 64 + 675 = 739 (see the
+## width rule in _load_level), and the paddle line is 890: a 151 px gap, where
+## it used to be 96 px (field bottom 664, paddle 760). At 420 px/s that is
+## 0.36 s of visible ball travel instead of 0.23 s, which is the reaction room
+## Choubey asked for. The safety floor moved down with the bar
+## (SafetyFloor.Y = 930) and the loss line is still below the frame at 1000.
+const PADDLE_Y := 890.0
 ## The reference pace, unchanged: 420 px/s is the take level_01/02/03 were
 ## tuned at, and a swept move_and_collide query makes any of these speeds
 ## tunnel-proof on the 4 px level_04 bricks.
@@ -62,13 +67,25 @@ const MAX_BALLS_DENSE := 180
 ## level_03 1,064, so those three keep the reference pace they were tuned at.
 const DENSE_BRICKS := 2500
 const MAX_POWERUPS := 40
-## Chance per broken brick of dropping a power-up (the pool below picks which),
-## plus two guaranteed drops that
-## put the first multi-ball on screen around the reference's t=8s: the channel's
-## two tip cells always drop one, and so does the FIRST_DROP_BRICKS-th brick of
-## a take (whichever brick that turns out to be — the outcome still comes from
-## play, nothing is scripted).
-const POWERUP_CHANCE := 0.20
+## Brief 25 — the drop PACE is time-based, not a flat number: the chance per
+## broken brick ramps from START to END across RAMP_SECONDS of ELAPSED GAME
+## TIME, so the early game is slower (few drops, few extra balls, a long
+## ramp-up) and the mid/late game is faster (more drops per brick, more balls,
+## a quicker finish). Measured with the new layout, the flat 0.20 was simply too
+## slow once the field got bigger and the paddle moved down (level_05_messi
+## cleared at 60.2 s, level_04 at 100.0 s), so the END of the ramp is well above
+## the old value and the ramp is only 30 s long: the full rate is reached at
+## the middle of a ~1 minute take and held there, which is exactly "slow at the
+## start, fast from the middle". It is a GLOBAL rule: it reads elapsed time
+## only, never the level id or the level's size.
+##
+## The two guaranteed drops that put the first multi-ball in the EARLY game are
+## untouched by the ramp: the channel's two tip cells always drop one, and so
+## does the FIRST_DROP_BRICKS-th brick of a take (whichever brick that turns out
+## to be — the outcome still comes from play, nothing is scripted).
+const POWERUP_CHANCE_START := 0.10
+const POWERUP_CHANCE_END := 0.42
+const POWERUP_RAMP_SECONDS := 40.0
 ## The drop pool. The six kinds sum to exactly 1.0:
 ##   +3 52%   x3 20%   minus 9%   star 5%   safety floor 10%   NUKE 4%
 ## "+3"/"x3" keep the reference's multi-ball rhythm; minus/star stay rare so
@@ -283,9 +300,18 @@ func _build_walls() -> void:
 	var specs := [
 		# centre, size  — top wall sits on the grid's top edge, sides run the
 		# full height so the black play floor is walled in as well.
+		#
+		# Brief 25: the side walls are pulled 2 px INWARD so their inner faces
+		# (x = 2 and 538) sit BEHIND the edge bricks (a brick body is cell - 2
+		# wide, so at 13.5 px pitch the outermost body starts at x = 1). When the
+		# field was 30 px in from each wall that seam never mattered; with the
+		# field flush to the frame the 1 px slot between wall and brick became a
+		# squeeze channel and the ball was extruded OUT of the arena (measured:
+		# sim ball_x reached -46 and 632). Overlapping the wall behind the brick
+		# removes the slot, so a squeezed ball is pushed back inside.
 		[Vector2(270, 64), Vector2(560, 20)],
-		[Vector2(-10, 480), Vector2(20, 980)],
-		[Vector2(550, 480), Vector2(20, 980)],
+		[Vector2(-8, 480), Vector2(20, 980)],
+		[Vector2(548, 480), Vector2(20, 980)],
 	]
 	for s in specs:
 		var shape := CollisionShape2D.new()
@@ -308,6 +334,17 @@ func _load_level() -> void:
 	rows = int(level["rows"])
 	cell = float(level["cell"])
 	origin = level["origin"]
+	# --- Brief 25 LAYOUT (follow-up 3): the field spans the FULL 540 px width,
+	# with no empty background margin left or right of the portrait. The pitch is
+	# DERIVED from the column count instead of being read from the JSON, so the
+	# rule is identical for every level (and for an editor-saved one): 40 columns
+	# -> 13.5 px, 80 columns -> 6.75 px, both exactly VIEW.x wide. One uniform
+	# scale is used for both axes (the vertical origin the level carries is kept),
+	# so the art is scaled up, never stretched, and no column is cropped: the
+	# grid is 540 x 675 for every shipped level. Only x moves to 0 — the level's
+	# own top offset stays, which is what keeps the HUD and the top wall clear.
+	cell = VIEW.x / float(cols)
+	origin = Vector2(0.0, origin.y)
 	grid = level["grid"]
 	# The win counts BREAKABLE bricks only: the solid border is a wall, and
 	# counting it would make a level unwinnable (it can never be broken).
@@ -356,6 +393,14 @@ func ball_speed() -> float:
 
 func ball_cap() -> int:
 	return MAX_BALLS_DENSE if is_dense_field() else MAX_BALLS
+
+
+## Brief 25: the power-up drop chance at THIS instant of the take — a straight
+## line from POWERUP_CHANCE_START at t=0 to POWERUP_CHANCE_END at
+## POWERUP_RAMP_SECONDS, held at END afterwards. Same value on every level.
+func powerup_chance() -> float:
+	var t := clampf(elapsed / POWERUP_RAMP_SECONDS, 0.0, 1.0)
+	return lerpf(POWERUP_CHANCE_START, POWERUP_CHANCE_END, t)
 
 
 # ------------------------------------------------------------------ flow
@@ -461,6 +506,15 @@ func _tick_balls() -> void:
 			b.position.y = SafetyFloor.Y - Ball.RADIUS - 0.5
 			b.vel.y = -absf(b.vel.y)
 			AudioManager.play("bounce", -8.0)
+		# ARENA CONTAINMENT. The field is flush to the frame (Brief 25), so the
+		# ball can be squeezed into a wall/brick junction and come out on the
+		# wrong side; a ball outside the arena can never come back and can travel
+		# sideways for a whole take (measured once: x = 15194). Reflect it back at
+		# the wall's inner face instead. This never fires in normal play — it is
+		# the same kind of last-resort guard as the safety floor below.
+		if b.position.x < Ball.RADIUS or b.position.x > VIEW.x - Ball.RADIUS:
+			b.position.x = clampf(b.position.x, Ball.RADIUS, VIEW.x - Ball.RADIUS)
+			b.vel.x = -b.vel.x
 		if b.position.y > LOSS_Y:
 			b.active = false
 			_balls.erase(b)
@@ -988,7 +1042,7 @@ func break_cell(c: Vector2i, silent := false) -> void:
 		_tip_cells.erase(c)
 	var first_drop := brick_hits == FIRST_DROP_BRICKS
 	if bricks_left > 0 and elapsed >= DROP_DELAY \
-			and (was_tip or first_drop or rng.randf() < POWERUP_CHANCE):
+			and (was_tip or first_drop or rng.randf() < powerup_chance()):
 		_drop_powerup(p)
 	_check_star_milestones()
 	if bricks_left <= win_leftover():

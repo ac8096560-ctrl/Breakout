@@ -580,12 +580,21 @@ func _check_nuke(g: Node) -> void:
 # Brief 20: x3 in-place split, 3-star collectible, safety floor, the solid
 # guide-path level and the combo chain.
 
+## The y of the open black strip between the field's bottom edge and the paddle
+## (Brief 25 moved both). A parked / keep-alive ball lives there: below every
+## brick, above the paddle, so it cannot break anything or get caught while a
+## suite measures something else. Derived, never a fixed 700 — the field bottom
+## is cols*cell tall now, so a hard-coded y would land inside the grid.
+func _open_band_y(g: Node, below := 36.0) -> float:
+	return float(g.origin.y + float(g.rows) * g.cell) + below
+
+
 ## A ball parked BELOW the brick field moving sideways: it keeps the flow in
 ## STATE_PLAYING (so the timers tick) without ever breaking a brick.
 func _park_ball(g: Node) -> void:
 	g.debug_clear_balls()
 	g.debug_clear_powerups()
-	g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+	g.debug_spawn_ball(Vector2(270.0, _open_band_y(g)), Vector2(60.0, 0.0))
 	g.debug_ensure_playing()
 
 
@@ -756,7 +765,7 @@ func _check_safety_floor(g: Node) -> void:
 	while bool(g.floor_active()) and guard < 3000:
 		g.debug_ensure_playing()
 		if int(g.ball_count()) == 0:
-			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+			g.debug_spawn_ball(Vector2(270.0, _open_band_y(g)), Vector2(60.0, 0.0))
 		await get_tree().physics_frame
 		guard += 1
 	var lasted := float(g.elapsed) - t_start
@@ -786,10 +795,13 @@ func _check_safety_floor(g: Node) -> void:
 
 	# 5) a falling POWER-UP falls straight through the floor
 	var p: PowerUp = g.debug_spawn_powerup_at_paddle("plus3")
-	p.position = Vector2(150.0, 850.0)
-	for i in 40:
+	# Start ABOVE the floor and fall PAST it. The threshold is the floor's own Y,
+	# not a fixed number, so the check can never go vacuous when the layout moves
+	# the bar (it is now at 930, not 880).
+	p.position = Vector2(150.0, SafetyFloor.Y - 75.0)
+	for i in 70:
 		await get_tree().physics_frame
-	var through := is_instance_valid(p) and p.alive and p.position.y > 890.0
+	var through := is_instance_valid(p) and p.alive and p.position.y > SafetyFloor.Y + 10.0
 	if is_instance_valid(p):
 		p.alive = false
 		p.queue_free()
@@ -800,7 +812,7 @@ func _check_safety_floor(g: Node) -> void:
 	for i in 120:
 		g.debug_ensure_playing()
 		if int(g.ball_count()) == 0:
-			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+			g.debug_spawn_ball(Vector2(270.0, _open_band_y(g)), Vector2(60.0, 0.0))
 		await get_tree().physics_frame
 	var mid := float(g.floor_left())
 	g.debug_spawn_powerup_at_paddle("floor")
@@ -815,7 +827,7 @@ func _check_safety_floor(g: Node) -> void:
 	while bool(g.floor_active()) and guard2 < 3000:
 		g.debug_ensure_playing()
 		if int(g.ball_count()) == 0:
-			g.debug_spawn_ball(Vector2(270.0, 700.0), Vector2(60.0, 0.0))
+			g.debug_spawn_ball(Vector2(270.0, _open_band_y(g)), Vector2(60.0, 0.0))
 		await get_tree().physics_frame
 		guard2 += 1
 	Engine.time_scale = 1.0
@@ -853,11 +865,15 @@ func _catch_star(g: Node, idx := 0) -> bool:
 	return true
 
 
+## Put a star PAST the paddle (where the game counts it lost), derived from the
+## paddle's own line instead of a fixed y: Brief 25 moved the paddle down to
+## 890, so a hard-coded 800 would now sit above it and the star would never be
+## missed. Intent is unchanged — the star is off to the side and below the bar.
 func _miss_star(g: Node, idx := 0) -> bool:
 	if g._stars.size() <= idx:
 		return false
 	var s := g._stars[idx] as StarPickup
-	s.position = Vector2(g.paddle.position.x + 220.0, 800.0)
+	s.position = Vector2(g.paddle.position.x + 220.0, g.paddle.position.y + 30.0)
 	return true
 
 
@@ -1027,11 +1043,11 @@ func _check_level03() -> void:
 	g.debug_clear_balls()
 	g.debug_clear_powerups()
 	g.debug_ensure_playing()
-	g.debug_spawn_ball(Vector2(entry_x, 738.0), Vector2(0, -420))
+	g.debug_spawn_ball(Vector2(entry_x, _open_band_y(g, 74.0)), Vector2(0, -420))
 	for i in 200:
 		g.lives = 3
 		if int(g.ball_count()) == 0:
-			g.debug_spawn_ball(Vector2(entry_x, 738.0), Vector2(0, -420))
+			g.debug_spawn_ball(Vector2(entry_x, _open_band_y(g, 74.0)), Vector2(0, -420))
 		g.debug_ensure_playing()
 		await get_tree().physics_frame
 		if not hits.is_empty():

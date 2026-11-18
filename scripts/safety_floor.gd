@@ -13,7 +13,7 @@ class_name SafetyFloor extends Node2D
 ## reads active().
 ##
 ## Visual: a wide cyan bar with a halo — deliberately unlike the salmon paddle
-## (104 x 14 at y = 760) it protects.
+## (104 x 14 at y = 890) it protects.
 
 const DURATION := 10.0
 ## The bar blinks for this long before it disappears, so the player knows the
@@ -22,8 +22,11 @@ const WARN_SECONDS := 2.0
 const WIDTH := 498.0
 const HEIGHT := 7.0
 ## Just above the bottom edge of the 540x960 frame (bottom = 960), well below
-## the paddle line (760).
-const Y := 880.0
+## the paddle line (890). Brief 25 moved the paddle down to open the gap under
+## the portrait, so the bar moved down with it (880 -> 930) and stays 33 px
+## under the paddle's face — it must never sit ABOVE the paddle, or it would
+## reflect the ball before the player could catch it and no level could be won.
+const Y := 930.0
 
 var left := 0.0
 var pal: Dictionary = {}
