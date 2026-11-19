@@ -25,6 +25,18 @@ const VIEW := Vector2(540, 960)
 const FIELD_TOP := 64.0
 const DEFAULT_CELL := 12.0
 
+## BRIEF 26 — the blank band Choubey leaves in a portrait for the corridor.
+## A band is a horizontal run of empty cells with brick rows directly above and
+## below it; it must be at least BAND_MIN_CELLS long and cover BAND_MIN_FRACTION
+## of the grid, which is what tells it apart from a portrait's transparent
+## margin or its dark shading (both give short runs only).
+const BAND_MAX_HEIGHT := 2
+const BAND_MIN_CELLS := 8
+const BAND_MIN_FRACTION := 0.5
+## A grey bar around the band must run at least this share of the band's length
+## to count as a wall — see _band_solid_cells().
+const BAND_SOLID_MIN_RUN := 0.5
+
 var pal: Dictionary = {}
 var cols := 40
 var rows := 50
@@ -40,6 +52,7 @@ var _art: Array = []                 # painted bricks, BEFORE the carve
 var _channel: Dictionary = {}        # fork / stem_cols / stem_bottom / arms
 var _tips: Array = []                # Array[Vector2i]
 var _border_solid := true
+var _band_solid: Array[Vector2i] = [] # grey frame bars the import made solid
 var _palette: Array = []
 var _palette_index := 0
 var _tool := TOOL_PAINT
@@ -241,6 +254,7 @@ func new_level(c: int, r: int) -> void:
 	_art.fill(Color(0, 0, 0, 0))
 	_tips = []
 	_border_solid = true
+	_band_solid = []
 	_channel = {}
 	_loaded_id = ""
 	_loaded_json = ""
@@ -404,6 +418,10 @@ func unbreakable_cells() -> Array:
 	var listed: Array = []
 	if _border_solid:
 		listed = BreakoutLevelWriter.border_unbreakable(grid, cols, rows)
+	# BRIEF 26: the grey frame bars around an imported corridor band are walls.
+	for cell in _band_solid:
+		if not listed.has(cell):
+			listed.append(cell)
 	return BreakoutLevel.solid_cells(grid, cols, rows, listed)
 
 
@@ -518,6 +536,7 @@ func load_level_id(id: String) -> bool:
 	_channel = d.get("channel", {})
 	if not (_channel is Dictionary):
 		_channel = {}
+	_band_solid = []
 	_tips = []
 	for t in d.get("powerup_tips", []):
 		if t is Array and (t as Array).size() == 2:
@@ -583,12 +602,22 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 				_art[r * cols + c] = Color(0, 0, 0, 0)
 	# The channel is geometry, not art: keep a valid existing one, otherwise
 	# carve the default Y so the imported level has its two paths immediately.
-	var keep := not _channel.is_empty()
-	if keep:
-		var fork := _fork_cell()
-		keep = fork.x > 0 and fork.y > 0 and fork.x < cols and fork.y < rows
-	if not keep:
-		carve_at(Vector2i(cols / 2, int(round(rows * 0.68))))
+	# BRIEF 26 — IMPORT-TIME AUTO-CORRIDOR: Choubey ships portraits with the
+	# corridor's blank band built in, so when one is found IT sets the channel
+	# (never the default Y) and the grey bars around it become solid. Without a
+	# band the old keep-or-default-Y rule below still applies unchanged.
+	var band := find_blank_band(_art, cols, rows)
+	_band_solid = []
+	if not band.is_empty():
+		_set_band_channel(band)
+		_band_solid = _band_solid_cells(band)
+	else:
+		var keep := not _channel.is_empty()
+		if keep:
+			var fork := _fork_cell()
+			keep = fork.x > 0 and fork.y > 0 and fork.x < cols and fork.y < rows
+		if not keep:
+			carve_at(Vector2i(cols / 2, int(round(rows * 0.68))))
 	_tips = []
 	_derive_tips()
 	_border_solid = true
@@ -597,10 +626,120 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 	_dirty = true
 	var cnt := counts()
 	AudioManager.play("confirm")
-	_refresh("imported %s  •  %dx%d art stretched to %dx%d  •  %d bricks / %d breakable" % [
-		path.get_file(), src_w, src_h, cols, rows, int(cnt["bricks"]), int(cnt["breakable"])])
+	var band_note := ""
+	if not band.is_empty():
+		band_note = "  •  blank band row %d: corridor auto-set (fork %s), %d grey frame cells solid" % [
+			int(band["row"]), str(Vector2i(int(_channel["fork"][0]), int(_channel["fork"][1]))),
+			_band_solid.size()]
+	_refresh("imported %s  •  %dx%d art stretched to %dx%d  •  %d bricks / %d breakable%s" % [
+		path.get_file(), src_w, src_h, cols, rows, int(cnt["bricks"]), int(cnt["breakable"]),
+		band_note])
 	return {"ok": true, "err": "", "cols": cols, "rows": rows,
-		"source_w": src_w, "source_h": src_h, "bricks": int(cnt["bricks"])}
+		"source_w": src_w, "source_h": src_h, "bricks": int(cnt["bricks"]),
+		"band_row": int(band.get("row", -1)), "band_cells": int(band.get("length", 0)),
+		"band_solid": _band_solid.size()}
+
+
+## BRIEF 26 — find the corridor band in imported art: the longest horizontal run
+## of EMPTY cells that has a brick row directly above and directly below it (1 or
+## 2 rows tall, matching how Choubey draws it). Returns
+## {row, height, first, last, length} or {} when the art has no band.
+##
+## Requiring bricks on both sides is what keeps open background out of the run:
+## the portrait's transparent margin has no bricks above it. The length floor then
+## rejects the short runs a portrait's shading leaves behind.
+func find_blank_band(grid: Array, c_count: int, r_count: int) -> Dictionary:
+	var best: Dictionary = {}
+	var need := maxi(BAND_MIN_CELLS, int(ceil(float(c_count) * BAND_MIN_FRACTION)))
+	for height in range(1, BAND_MAX_HEIGHT + 1):
+		for r in range(1, r_count - height):
+			var run_start := -1
+			for c in range(0, c_count + 1):
+				var in_band := c < c_count and _band_column(grid, c_count, r_count, c, r, height)
+				if in_band and run_start < 0:
+					run_start = c
+				elif not in_band and run_start >= 0:
+					var length := c - run_start
+					# The band is a CLOSED slot: bricks at both of its ends ("between
+					# two frame bars"). Without that, an already-carved corridor left
+					# in a shipped PNG (Ronaldo's 2-row strip runs on past its stem)
+					# would read as a band and silently re-carve the level.
+					var closed := run_start > 0 and c < c_count \
+						and BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(run_start - 1, r)) \
+						and BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r))
+					if closed and length >= need and length > int(best.get("length", 0)):
+						best = {"row": r, "height": height, "first": run_start,
+							"last": c - 1, "length": length}
+					run_start = -1
+	return best
+
+
+## Is (c, r) the first empty row of a band `height` rows tall, with bricks
+## directly above and below it?
+func _band_column(grid: Array, c_count: int, r_count: int, c: int, r: int,
+		height: int) -> bool:
+	for k in height:
+		if BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r + k)):
+			return false
+	if not BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r - 1)):
+		return false
+	return BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r + height))
+
+
+## BRIEF 26 — set the channel FROM the band: the fork sits in the band, the stem
+## runs down under it to the last row, and one arm runs along the band to each
+## end. `arm_width` stays 1 so the carve never leaves the blank row — a wider
+## brush would eat the brick rows above and below the band (the Kai v1 mistake).
+func _set_band_channel(band: Dictionary) -> void:
+	var row := int(band["row"])
+	var first_col := int(band["first"])
+	var last_col := int(band["last"])
+	# The fork sits one cell in from the band's left end so that BOTH arm tips
+	# land on the frame bricks: BreakoutLevelWriter.validate() refuses an arm
+	# that does not resolve to a brick, and an arm pointing down the stem (empty
+	# all the way to the bottom row) can never resolve — the vertical corridor is
+	# the stem itself, which stem_cols/stem_bottom carve.
+	var fx := clampi(mini(first_col + 1, last_col), 1, cols - 2)
+	_channel = {
+		"fork": [fx, row],
+		"stem_cols": [fx, fx + 1],
+		"stem_bottom": rows - 1,
+		"arm_width": 1,
+		"arms": [[last_col, row], [first_col, row]],
+	}
+
+
+## BRIEF 26 — the solid frame: grey bricks directly above and below the band,
+## classified by the loader's own rule (BreakoutLevel.is_grey).
+##
+## Only a grey BAR counts: a continuous run along the band of at least half the
+## band's length. Choubey's corridor walls run the band's whole length, while a
+## portrait's shading also lands in the grey range by a pixel or two (Pattinson's
+## collar reads chroma 24 against the 25 limit) — those scattered cells are
+## picture content and must stay breakable.
+func _band_solid_cells(band: Dictionary) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var row := int(band["row"])
+	var first_col := int(band["first"])
+	var last_col := int(band["last"])
+	var min_run := maxi(4, int(ceil(float(last_col - first_col + 1) * BAND_SOLID_MIN_RUN)))
+	for rr in [row - 1, row + int(band["height"])]:
+		if rr < 0 or rr >= rows:
+			continue
+		var run_start := -1
+		for c in range(first_col, last_col + 2):
+			var grey_bar := false
+			if c <= last_col:
+				grey_bar = BreakoutLevelWriter.is_brick(_art, cols, rows, Vector2i(c, rr)) \
+					and BreakoutLevel.is_grey(_art[rr * cols + c])
+			if grey_bar and run_start < 0:
+				run_start = c
+			elif not grey_bar and run_start >= 0:
+				if c - run_start >= min_run:
+					for cc in range(run_start, c):
+						out.append(Vector2i(cc, rr))
+				run_start = -1
+	return out
 
 
 func _fork_cell() -> Vector2i:
@@ -713,7 +852,7 @@ func _pixel_level_id(path: String) -> String:
 
 func _open_pixel_import_dialog() -> void:
 	_open_import_dialog(0, 0, true)
-	_refresh("pick a pixel-art PNG — 1 pixel becomes 1 brick and grey walls turn solid")
+	_refresh("pick a pixel-art PNG — 1 pixel becomes 1 brick, a blank corridor band sets the channel and the grey bars around it turn solid")
 
 
 func _next_load_id() -> String:
@@ -753,6 +892,7 @@ func snapshot() -> Dictionary:
 		"level_id": level_id, "display_name": display_name, "topic": topic,
 		"art": _art.duplicate(), "channel": _channel.duplicate(true),
 		"tips": _tips.duplicate(), "border": _border_solid,
+		"band_solid": _band_solid.duplicate(),
 		"allow_overwrite": allow_overwrite, "loaded_id": _loaded_id,
 		"loaded_json": _loaded_json,
 	}
@@ -774,6 +914,10 @@ func restore(s: Dictionary) -> void:
 	_channel = (s.get("channel", {}) as Dictionary).duplicate(true)
 	_tips = (s.get("tips", []) as Array).duplicate()
 	_border_solid = bool(s.get("border", true))
+	_band_solid = []
+	for cell in (s.get("band_solid", []) as Array):
+		if cell is Vector2i:
+			_band_solid.append(cell)
 	allow_overwrite = bool(s.get("allow_overwrite", false))
 	_loaded_id = str(s.get("loaded_id", ""))
 	_loaded_json = str(s.get("loaded_json", ""))
