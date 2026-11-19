@@ -124,6 +124,9 @@ func _suite_all() -> void:
 	g7.queue_free()
 	await get_tree().process_frame
 
+	# BRIEF 24 Part 2 changes scenes, so it runs last.
+	await _check_back_button()
+
 	await _report("WR_BREAKOUT_RESULT", _fails == 0, "failing suites: %d" % _fails)
 
 
@@ -1200,6 +1203,9 @@ func _suite_editor() -> void:
 		int(scene.bricks_left) if scene != null and scene.has_signal("game_ended") else -1])
 
 	await _check_editor_import(ed)
+	await _check_import_no_default_y(ed)
+	await _check_editor_zoom(ed)
+	await _check_editor_undo(ed)
 	await _check_grey_frame()
 
 	await _report("WR_BREAKOUT_EDITOR_RESULT", _fails == 0, "failing suites: %d" % _fails)
@@ -1291,6 +1297,361 @@ func _check_editor_import(ed: Node) -> void:
 		if FileAccess.file_exists(p):
 			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
 	Game.refresh_levels()
+
+
+# ------------------------------------------------------------ BRIEF 24 tests
+## PART 1 — importing art must NOT carve a default Y. The shipped Ronaldo PNG
+## is the test input: it carries its own drawn corridor and NO blank band, so
+## an import must reproduce it pixel for pixel — every opaque source pixel a
+## brick at the same cell, not one channel cell cleared — and the imported level
+## must save without a fork and load back without the loader carving one.
+func _check_import_no_default_y(ed: Node) -> void:
+	var src := "res://data/levels/level_04_ronaldo.png"
+	var img: Image = BreakoutLevel.load_png_image(src)
+	if img == null:
+		_suite("editor_import_no_default_y", false, "cannot decode %s" % src)
+		return
+	img.convert(Image.FORMAT_RGBA8)
+	var gc := img.get_width()
+	var gr := img.get_height()
+	var opaque := 0
+	for r in gr:
+		for c in gc:
+			if img.get_pixel(c, r).a >= 0.5:
+				opaque += 1
+
+	# --- IMPORT ANY ART, onto a grid the art's own size (no resampling)
+	ed.new_level(gc, gr)
+	var res: Dictionary = ed.import_art(src)
+	var no_fork: bool = (ed.channel_spec() as Dictionary).is_empty()
+	var cleared: int = (ed._carved()["cells"] as Array).size()
+	var mismatch := 0
+	for r in gr:
+		for c in gc:
+			var brick: bool = (ed.colour_at(Vector2i(c, r)) as Color).a >= 0.5
+			if brick != (img.get_pixel(c, r).a >= 0.5):
+				mismatch += 1
+	var saved: Dictionary = ed.save_to("user://breakout_editor_test")
+	var lv: Dictionary = BreakoutLevel.load_level(str(saved.get("json", "")))
+	var import_ok: bool = bool(res.get("ok", false)) and no_fork and cleared == 0 \
+		and mismatch == 0 and bool(saved.get("ok", false)) and bool(lv.get("ok", false)) \
+		and int(lv.get("bricks", -1)) == opaque \
+		and int((lv.get("channel_cells", []) as Array).size()) == 0
+	_suite("editor_import_no_default_y", import_ok,
+		"import %dx%d opaque=%d grid_bricks=%d mismatch=%d carved=%d no_fork=%s saved=%s loader_bricks=%d loader_channel=%d" % [
+			gc, gr, opaque, int(ed.counts()["bricks"]), mismatch, cleared, str(no_fork),
+			str(saved.get("ok", false)), int(lv.get("bricks", -1)),
+			int((lv.get("channel_cells", []) as Array).size())])
+
+	# --- IMPORT PIXEL (1 pixel = 1 brick, auto-saved into user://levels)
+	var px: Dictionary = ed.import_pixel_file(src)
+	var pid := str(px.get("id", ""))
+	var pjson := str(px.get("json", ""))
+	var plv: Dictionary = BreakoutLevel.load_level(pjson)
+	var pmismatch := 0
+	for r in gr:
+		for c in gc:
+			if ((ed.colour_at(Vector2i(c, r)) as Color).a >= 0.5) != (img.get_pixel(c, r).a >= 0.5):
+				pmismatch += 1
+	var pixel_ok: bool = bool(px.get("ok", false)) \
+		and (ed.channel_spec() as Dictionary).is_empty() and pmismatch == 0 \
+		and bool(plv.get("ok", false)) and int(plv.get("bricks", -1)) == opaque \
+		and int((plv.get("channel_cells", []) as Array).size()) == 0
+	_suite("editor_pixel_import_no_default_y", pixel_ok,
+		"pixel id=%s opaque=%d grid_bricks=%d mismatch=%d no_fork=%s saved=%s loader_bricks=%d loader_channel=%d" % [
+			pid, opaque, int(ed.counts()["bricks"]), pmismatch,
+			str((ed.channel_spec() as Dictionary).is_empty()), str(bool(px.get("ok", false))),
+			int(plv.get("bricks", -1)),
+			int((plv.get("channel_cells", []) as Array).size())])
+	for p in [pjson, str(px.get("png", ""))]:
+		if str(p) != "" and FileAccess.file_exists(str(p)):
+			DirAccess.remove_absolute(ProjectSettings.globalize_path(str(p)))
+	Game.refresh_levels()
+
+
+## PART 3 — the editor zoom is a VIEW transform: clamped, anchored on the point
+## it zooms around, and it never changes the saved cell / origin / grid / channel.
+func _check_editor_zoom(ed: Node) -> void:
+	# The case the brief names: the shipped 80x100 Ronaldo level (cell 6), with
+	# its own art, channel and tips — so a save is a valid, ordinary level.
+	var loaded: bool = ed.load_level_id("level_04_ronaldo") \
+		and ed.cols == 80 and ed.rows == 100
+	ed.level_id = "editor_zoom_level"
+	ed.select_colour(0)
+	ed.set_tool("paint")
+	var dir_a := "user://breakout_editor_zoom_a"
+	var dir_b := "user://breakout_editor_zoom_b"
+	var save_a: Dictionary = ed.save_to(dir_a)
+	var cell_saved: float = ed.cell
+	var origin_saved: Vector2 = ed.origin
+
+	ed.set_zoom(99.0)
+	var clamp_hi: bool = is_equal_approx(float(ed.zoom()), 4.0)
+	ed.set_zoom(0.1)
+	var clamp_lo: bool = is_equal_approx(float(ed.zoom()), 1.0)
+
+	# Zooming around a point keeps the SAME CELL under that point on screen.
+	# The anchor is a canvas-local point, so the check is made in editor space:
+	# the canvas moves when the zoom changes.
+	ed.reset_view()
+	var anchor := Vector2(143.0, 97.0)
+	var view_pos: Vector2 = ed._view.position
+	var editor_pt: Vector2 = view_pos + ed._canvas.position + anchor
+	var pitch0: float = float(ed.cell) * float(ed.zoom())
+	var rel0: Vector2 = editor_pt - view_pos - ed._canvas.position
+	var cell_before := Vector2i(floori(rel0.x / pitch0), floori(rel0.y / pitch0))
+	ed.zoom_at(3.0, anchor)
+	var pitch1: float = float(ed.cell) * float(ed.zoom())
+	var rel1: Vector2 = editor_pt - view_pos - ed._canvas.position
+	var cell_after := Vector2i(floori(rel1.x / pitch1), floori(rel1.y / pitch1))
+	var anchored: bool = cell_before == cell_after \
+		and is_equal_approx(float(ed.zoom()), 3.0)
+
+	ed.pan_by(Vector2(-30.0, -40.0))
+	var panned: bool = ed.pan_offset() != Vector2.ZERO
+
+	# saving while zoomed + panned must produce a byte-identical JSON
+	var save_b: Dictionary = ed.save_to(dir_b)
+	var json_a := FileAccess.get_file_as_string(str(save_a.get("json", "")))
+	var json_b := FileAccess.get_file_as_string(str(save_b.get("json", "")))
+	var identical: bool = json_a != "" and json_a == json_b \
+		and is_equal_approx(ed.cell, cell_saved) and ed.origin == origin_saved \
+		and is_equal_approx(float(ed.cell), 6.0)
+
+	# the painted cell is exactly the one under the finger while zoomed
+	ed.set_tool("paint")
+	var target := Vector2i(12, 20)
+	ed.pointer(ed.cell_center_local(target))
+	var painted: bool = (ed.colour_at(target) as Color).a >= 0.5
+	ed.set_tool("erase")
+	ed.pointer(ed.cell_center_local(target))
+	var erased: bool = (ed.colour_at(target) as Color).a < 0.5
+	# channel carving hits the same cell while zoomed
+	ed.set_tool("channel")
+	ed.pointer(ed.cell_center_local(Vector2i(30, 55)))
+	var carved: bool = (ed.channel_spec().get("fork", []) as Array) == [30, 55]
+
+	ed.reset_view()
+	var reset: bool = is_equal_approx(float(ed.zoom()), 1.0) and ed.pan_offset() == Vector2.ZERO
+	_suite("editor_zoom_view_only",
+		loaded and clamp_hi and clamp_lo and anchored and panned and identical \
+			and painted and erased and carved and reset,
+		"loaded=%s %dx%d clamp=%s..%s anchor_cell=%s/%s pan=%s json_identical=%s paint=%s erase=%s carve=%s reset=%s" % [
+			str(loaded), int(ed.cols), int(ed.rows), str(clamp_hi), str(clamp_lo),
+			str(cell_before), str(cell_after), str(panned),
+			str(identical), str(painted), str(erased), str(carved), str(reset)])
+	for d in [dir_a, dir_b]:
+		for ext in [".json", ".png"]:
+			var p := ProjectSettings.globalize_path(str(d).path_join("editor_zoom_level%s" % ext))
+			if FileAccess.file_exists(p):
+				DirAccess.remove_absolute(p)
+
+
+## PART 4 — UNDO / REDO in the editor.
+func _check_editor_undo(ed: Node) -> void:
+	ed.new_level(20, 26)
+	var red := Color(0.8, 0.25, 0.25)
+	var depth_at_start: int = ed.undo_depth()
+	var start_can_undo: bool = ed.can_undo()
+	var start_can_redo: bool = ed.can_redo()
+	var disabled_at_start: bool = not start_can_undo and ed._undo_button.disabled \
+		and not start_can_redo and ed._redo_button.disabled and depth_at_start == 0
+	# A SAVEABLE level: bricks around the channel's arm tips, then a real carve.
+	# Everything below paints on cells this block leaves empty (row 1 and row 2).
+	for r in range(4, 23):
+		for c in range(0, 20):
+			ed.paint_cell(Vector2i(c, r), Color(0.5, 0.3, 0.3))
+	ed.carve_at(Vector2i(10, 18))
+	var level_built: bool = int(ed.counts()["bricks"]) > 200 and not (ed.tips() as Array).is_empty()
+
+	var three := [Vector2i(3, 2), Vector2i(4, 2), Vector2i(5, 2)]
+	for c in three:
+		ed.paint_cell(c, red)
+	var painted_all := true
+	for c in three:
+		if (ed.colour_at(c) as Color).a < 0.5:
+			painted_all = false
+	var undo_enabled: bool = ed.can_undo() and not ed._undo_button.disabled
+	var redo_disabled_after_paint: bool = not ed.can_redo() and ed._redo_button.disabled
+
+	ed.undo()
+	ed.undo()
+	ed.undo()
+	var all_gone := true
+	for c in three:
+		if (ed.colour_at(c) as Color).a >= 0.5:
+			all_gone = false
+	var redo_enabled: bool = ed.can_redo() and not ed._redo_button.disabled
+
+	ed.redo()
+	ed.redo()
+	ed.redo()
+	var all_back := true
+	for c in three:
+		if (ed.colour_at(c) as Color).a < 0.5:
+			all_back = false
+
+	# one drag stroke = ONE undo step
+	ed.begin_stroke()
+	for i in 10:
+		ed.paint_cell(Vector2i(2 + i, 1), red)
+	ed.end_stroke()
+	var depth_before: int = ed.undo_depth()
+	ed.undo()
+	var stroke_gone := true
+	for i in 10:
+		if (ed.colour_at(Vector2i(2 + i, 1)) as Color).a >= 0.5:
+			stroke_gone = false
+	var one_step: bool = ed.undo_depth() == depth_before - 1
+
+	# a new paint drops the redo branch
+	ed.paint_cell(Vector2i(9, 2), red)
+	var branch_cleared: bool = not ed.can_redo() and ed._redo_button.disabled
+
+	# save AFTER an undo writes the undone state (two DIFFERENT dirs, so the two
+	# files cannot overwrite each other and the comparison means something)
+	ed.level_id = "editor_undo_level"
+	ed.paint_cell(Vector2i(2, 2), red)
+	var before: Dictionary = ed.save_to("user://breakout_editor_undo_a")
+	var bricks_before_undo: int = int(ed.counts()["bricks"])
+	var undo_ok: bool = ed.undo()
+	var bricks_after_undo: int = int(ed.counts()["bricks"])
+	var after: Dictionary = ed.save_to("user://breakout_editor_undo_b")
+	var lv: Dictionary = BreakoutLevel.load_level(str(after.get("json", "")))
+	# The level's bricks live in the PNG (the JSON carries geometry), so the
+	# undone state is proved by loading the saved file back and comparing the
+	# whole grid the editor now shows.
+	var carved_now: Array = ed._carved()["grid"]
+	var loaded_grid: Array = lv.get("grid", [])
+	var grid_match: bool = loaded_grid.size() == carved_now.size()
+	if grid_match:
+		for i in loaded_grid.size():
+			if ((loaded_grid[i] as Color).a >= 0.5) != ((carved_now[i] as Color).a >= 0.5):
+				grid_match = false
+				break
+	var save_matches: bool = bool(after.get("ok", false)) and bool(lv.get("ok", false)) \
+		and grid_match and bricks_after_undo < bricks_before_undo \
+		and int(lv.get("bricks", -1)) == bricks_after_undo \
+		and FileAccess.get_file_as_bytes(str(before.get("png", ""))) \
+			!= FileAccess.get_file_as_bytes(str(after.get("png", "")))
+	var save_note := "before=%s(%s) after=%s(%s) lv=%d grid=%s undo=%s bricks %d->%d" % [
+		str(before.get("ok", false)), str(before.get("err", "")),
+		str(after.get("ok", false)), str(after.get("err", "")),
+		int(lv.get("bricks", -1)), str(grid_match), str(undo_ok),
+		bricks_before_undo, bricks_after_undo]
+
+	# CLEAR then UNDO brings the art back
+	ed._clear_art()
+	var cleared: bool = int(ed.counts()["bricks"]) == 0
+	ed.undo()
+	var cleared_back: bool = int(ed.counts()["bricks"]) > 0
+
+	# remove the channel, then carve: UNDO drops the carve, REDO brings it back
+	ed.clear_channel()
+	ed.carve_at(Vector2i(10, 18))
+	var fork_before: Array = (ed.channel_spec().get("fork", []) as Array).duplicate()
+	ed.undo()
+	var carve_undone: bool = (ed.channel_spec() as Dictionary).is_empty()
+	ed.redo()
+	var carve_redone: bool = (ed.channel_spec().get("fork", []) as Array) == fork_before
+
+	# desktop keys: Ctrl+Z / Ctrl+Y
+	var ez := InputEventKey.new()
+	ez.keycode = KEY_Z
+	ez.ctrl_pressed = true
+	ez.pressed = true
+	ed._unhandled_key_input(ez)
+	var ctrl_z: bool = (ed.channel_spec() as Dictionary).is_empty() and ed.can_redo()
+	var ey := InputEventKey.new()
+	ey.keycode = KEY_Y
+	ey.ctrl_pressed = true
+	ey.pressed = true
+	ed._unhandled_key_input(ey)
+	var ctrl_y: bool = (ed.channel_spec().get("fork", []) as Array) == fork_before
+
+	var ok: bool = level_built and disabled_at_start and painted_all and undo_enabled \
+		and redo_disabled_after_paint and all_gone and redo_enabled and all_back \
+		and one_step and stroke_gone and branch_cleared and save_matches \
+		and cleared and cleared_back and carve_undone and carve_redone \
+		and ctrl_z and ctrl_y
+	_suite("editor_undo_redo", ok,
+		"built=%s disabled_at_start=%s (can_undo=%s can_redo=%s depth=%d) enabled=%s redo_off=%s undo3=%s redo3=%s stroke1step=%s redo_cleared=%s save_after_undo=%s clear_undo=%s carve_undo=%s ctrl_z=%s ctrl_y=%s save_info=[%s]" % [
+			str(level_built), str(disabled_at_start), str(start_can_undo), str(start_can_redo),
+			depth_at_start, str(undo_enabled), str(redo_disabled_after_paint),
+			str(all_gone), str(all_back), str(one_step and stroke_gone),
+			str(branch_cleared), str(save_matches), str(cleared and cleared_back),
+			str(carve_undone and carve_redone), str(ctrl_z), str(ctrl_y),
+			save_note])
+	for d in ["user://breakout_editor_undo_a", "user://breakout_editor_undo_b"]:
+		for ext in [".json", ".png"]:
+			var p := ProjectSettings.globalize_path(str(d).path_join("editor_undo_level%s" % ext))
+			if FileAccess.file_exists(p):
+				DirAccess.remove_absolute(p)
+
+
+## PART 2 — the game screen's BACK button: present, tappable, clear of the
+## paddle/HUD, and it leaves the run cleanly mid-game, after a result popup, and
+## back to the editor for a take launched from the editor.
+func _check_back_button() -> void:
+	var g: Node = await _new_game()
+	g.debug_force_play()
+	await get_tree().process_frame
+	var btn: Button = g.get_node_or_null("BackLayer/BackButton") as Button
+	var present: bool = btn != null and btn.visible and btn.size.x >= 60.0 and btn.size.y >= 20.0
+	var rect := Rect2(btn.global_position, btn.size) if btn != null else Rect2()
+	var paddle_clear: bool = not rect.intersects(g.paddle.rect())
+	var hud_hits := ""
+	for child in g.hud.get_children():
+		if child is Label and (child as Label).visible and str((child as Label).text) != "":
+			var lr := Rect2((child as Control).global_position, (child as Control).size)
+			if lr.intersects(rect):
+				hud_hits += "%s | " % str((child as Label).text)
+	var hud_clear: bool = hud_hits == ""
+	var on_screen: bool = rect.position.x >= 0.0 and rect.position.y >= 0.0 \
+		and rect.end.x <= 540.0 and rect.end.y <= 960.0
+	var state_before := str(g.state)
+	var mid_ok: bool = (await _press_back(btn, "menu")) and state_before == "playing"
+	g.queue_free()
+	await get_tree().process_frame
+
+	var g2: Node = await _new_game()
+	g2.debug_force_play()
+	g2.state = "level_clear"
+	g2.hud.show_win(1234, 42.0, 2)
+	await get_tree().process_frame
+	var win_ok: bool = await _press_back(g2.get_node_or_null("BackLayer/BackButton") as Button, "menu")
+	g2.queue_free()
+	await get_tree().process_frame
+
+	Game.editor_return = true
+	var g3: Node = await _new_game()
+	g3.debug_force_play()
+	var editor_ok: bool = await _press_back(g3.get_node_or_null("BackLayer/BackButton") as Button, "editor")
+	Game.editor_return = false
+	g3.queue_free()
+	await get_tree().process_frame
+	Game.goto_menu()
+	await get_tree().process_frame
+
+	var ok: bool = present and paddle_clear and hud_clear and on_screen \
+		and mid_ok and win_ok and editor_ok
+	_suite("game_back_button", ok,
+		"present=%s paddle_clear=%s hud_clear=%s on_screen=%s mid_game=%s win=%s editor=%s hud_hits=[%s]" % [
+			str(present), str(paddle_clear), str(hud_clear), str(on_screen),
+			str(mid_ok), str(win_ok), str(editor_ok), hud_hits])
+
+
+## Press BACK and report whether the scene that replaced the run is `want`.
+func _press_back(btn: Button, want: String) -> bool:
+	if btn == null:
+		return false
+	btn.pressed.emit()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var scene: Node = get_tree().current_scene
+	if scene == null:
+		return false
+	return str(scene.scene_file_path).ends_with("%s.tscn" % want)
 
 
 ## Brief 23 B (follow-up) — A FRAME THAT A RESIZE LEFT IN PIECES.

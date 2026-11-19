@@ -107,10 +107,17 @@ static func load_level(json_path: String) -> Dictionary:
 			# alpha below 0.5 = empty cell. Fully opaque pixel = brick.
 			grid[r * cols + c] = px if px.a >= 0.5 else Color(0, 0, 0, 0)
 
-	# --- the required channel: stem + fork + two arms, carved AFTER the art so
-	# no level can ship without a path.
+	# --- the channel: stem + fork + two arms, carved AFTER the art so no level
+	# can ship without a path.
+	#
+	# BRIEF 24 — an imported level may deliberately carry NO channel: its JSON
+	# holds an EMPTY channel block, and then nothing is carved (the art is the
+	# level, exactly as drawn). Only an ABSENT channel key falls back to the
+	# default Y, which is the pre-existing behaviour for a bare level.
 	var channel: Dictionary = d.get("channel", {})
-	var channel_cells: Array[Vector2i] = carve_channel(grid, cols, rows, channel)
+	var channel_cells: Array[Vector2i] = []
+	if not (d.has("channel") and channel.is_empty()):
+		channel_cells = carve_channel(grid, cols, rows, channel)
 
 	# The stem columns, for the serve: the ball is aimed at the stem gap
 	# (the solid border leaves no other entry), so the game reads them from

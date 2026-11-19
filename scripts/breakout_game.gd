@@ -192,6 +192,8 @@ var powerups_root: Node2D
 var stars_root: Node2D
 var fx_root: Node2D
 var hud: Control
+## BRIEF 24 — the game screen's BACK button (there was no way out of a run).
+var _back_button: Button
 
 var _bodies: Dictionary = {}       # Vector2i -> Brick
 var _balls: Array = []
@@ -289,6 +291,21 @@ func _build_scene() -> void:
 	var panel := RecorderPanel.new()
 	panel.name = "RecorderPanel"
 	rec_layer.add_child(panel)
+
+	# BRIEF 24 — BACK. It sits in the free bottom-left corner: below the paddle
+	# line (890) and above the safety floor (930), clear of the HUD band, of the
+	# brick field and of the REC pill on the right, and the same size/style as
+	# the editor's "< BACK". Tapping it leaves the run — to the editor for a take
+	# launched from the editor, to the menu otherwise.
+	var back_layer := CanvasLayer.new()
+	back_layer.name = "BackLayer"
+	back_layer.layer = 15
+	add_child(back_layer)
+	_back_button = UITheme.button("< BACK", 10, Color(0.45, 0.45, 0.5), Vector2(90, 26))
+	_back_button.name = "BackButton"
+	_back_button.position = Vector2(6, 898)
+	_back_button.pressed.connect(_on_back_pressed)
+	back_layer.add_child(_back_button)
 
 
 func _build_walls() -> void:
@@ -901,7 +918,26 @@ func _cell_solid(c: Vector2i) -> bool:
 	return (grid[c.y * cols + c.x] as Color).a >= 0.5
 
 
+## BRIEF 24 — leave the run. An editor take returns to the editor (the same
+## rule the end-of-take click already uses); anything else returns to the menu.
+func _on_back_pressed() -> void:
+	if Game.editor_return:
+		Game.goto_editor()
+	else:
+		Game.goto_menu()
+
+
 func _input(event: InputEvent) -> void:
+	# BRIEF 24 — the BACK button owns its own corner: a tap there must not also be
+	# read as a paddle drag or as "click to continue" on the result popup.
+	if _back_button != null and is_instance_valid(_back_button):
+		var inside := false
+		if event is InputEventMouseButton:
+			inside = _back_button.get_global_rect().has_point((event as InputEventMouseButton).position)
+		elif event is InputEventScreenTouch:
+			inside = _back_button.get_global_rect().has_point((event as InputEventScreenTouch).position)
+		if inside:
+			return
 	if state == STATE_LEVEL_CLEAR or state == STATE_GAME_OVER:
 		if event is InputEventMouseButton and (event as InputEventMouseButton).pressed:
 			# A take launched from the editor goes back to the editor, not the menu.

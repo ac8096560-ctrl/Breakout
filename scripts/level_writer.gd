@@ -84,7 +84,7 @@ static func resolve_tip(grid: Array, cols: int, rows: int, fork: Vector2i,
 ## shipped level id (the editor asks for confirmation before setting it).
 static func validate(id: String, grid: Array, cols: int, rows: int,
 		channel: Dictionary, tips: Array, unbreakable: Array,
-		allow_shipped := false) -> Dictionary:
+		allow_shipped := false, require_channel := true) -> Dictionary:
 	if id.strip_edges() == "":
 		return _bad("the level id is empty — give the level a name")
 	for i in id.length():
@@ -97,6 +97,14 @@ static func validate(id: String, grid: Array, cols: int, rows: int,
 		return _bad("the grid is %dx%d — it must be at least 4x4" % [cols, rows])
 	if count_bricks(grid) <= 0:
 		return _bad("the grid is empty — paint some bricks first")
+	# BRIEF 24 — an IMPORTED level IS the art exactly as drawn, so it may carry
+	# no channel at all. Only the checks that do not depend on channel geometry
+	# apply to it; a blank/new level still has to have its two paths.
+	if not require_channel:
+		for u in unbreakable:
+			if not is_brick(grid, cols, rows, u as Vector2i):
+				return _bad("unbreakable cell %s is not a brick or is channel space" % str(u))
+		return {"ok": true, "err": ""}
 	if channel.is_empty():
 		return _bad("no channel — every level needs a fork (use the CHANNEL tool)")
 	var fork := Vector2i(-1, -1)
@@ -157,15 +165,25 @@ static func build_json(id: String, display_name: String, topic: String, image: S
 		"rows": rows,
 		"cell": cell,
 		"origin": [origin.x, origin.y],
-		"channel": {
-			"fork": channel.get("fork", [cols / 2, int(round(rows * 0.68))]),
-			"stem_cols": channel.get("stem_cols", [cols / 2, cols / 2 + 1]),
-			"stem_bottom": int(channel.get("stem_bottom", rows - 1)),
-			"arm_width": int(channel.get("arm_width", 3)),
-			"arms": channel.get("arms", []),
-		},
+		# BRIEF 24 — a level with NO channel writes an EMPTY channel block. The old
+		# defaults would have invented a fork + stem + arms, and the loader would
+		# then carve a Y into the imported art the moment it was played.
+		"channel": _channel_json(channel, cols, rows),
 		"powerup_tips": tip_list,
 		"unbreakable_cells": unb_list,
+	}
+
+
+## The channel block to write: the real spec, or {} when the level has none.
+static func _channel_json(channel: Dictionary, cols: int, rows: int) -> Dictionary:
+	if channel.is_empty():
+		return {}
+	return {
+		"fork": channel.get("fork", [cols / 2, int(round(rows * 0.68))]),
+		"stem_cols": channel.get("stem_cols", [cols / 2, cols / 2 + 1]),
+		"stem_bottom": int(channel.get("stem_bottom", rows - 1)),
+		"arm_width": int(channel.get("arm_width", 3)),
+		"arms": channel.get("arms", []),
 	}
 
 

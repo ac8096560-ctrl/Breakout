@@ -25,6 +25,15 @@ const VIEW := Vector2(540, 960)
 const FIELD_TOP := 64.0
 const DEFAULT_CELL := 12.0
 
+## BRIEF 24 — the editor's VIEW transform. Zoom and pan are DISPLAY ONLY: they
+## change what the canvas draws and how a pointer maps to a cell, never the
+## level's saved cell / origin / grid / channel.
+const ZOOM_MIN := 1.0
+const ZOOM_MAX := 4.0
+const ZOOM_STEP := 1.25
+## How many undo steps the history keeps (the brief asks for at least 50).
+const HISTORY_MAX := 64
+
 ## BRIEF 26 — the blank band Choubey leaves in a portrait for the corridor.
 ## A band is a horizontal run of empty cells with brick rows directly above and
 ## below it; it must be at least BAND_MIN_CELLS long and cover BAND_MIN_FRACTION
@@ -63,6 +72,22 @@ var _loaded_id := ""
 var _loaded_json := ""
 
 var _canvas: Control
+var _view: Control
+var _zoom := 1.0
+var _pan := Vector2.ZERO
+var _pan_mode := false
+var _history: Array = []          # undo stack of level states
+var _future: Array = []           # redo stack
+var _stroke_open := false
+var _stroke_before: Dictionary = {}
+## BRIEF 24 — an IMPORTED level may carry no channel at all (the art is the
+## level, taken exactly as drawn), so the "a level needs a fork" guard does not
+## apply to it. A blank/new level and a deliberately cleared channel still need
+## one.
+var _no_channel_ok := false
+var _undo_button: Button
+var _redo_button: Button
+var _pan_button: Button
 var _chip_row: HBoxContainer
 var _status_label: Label
 var _count_label: Label
@@ -124,10 +149,20 @@ func _build_ui() -> void:
 		_dirty = true)
 	add_child(_name_edit)
 
+	# BRIEF 24 — the grid lives inside a clipped viewport, so a zoomed or panned
+	# view can never draw over the palette and the toolbar below it.
+	_view = Control.new()
+	_view.name = "FieldView"
+	_view.position = Vector2(0, FIELD_TOP)
+	_view.size = Vector2(VIEW.x, VIEW.y - FIELD_TOP - 290.0)
+	_view.clip_contents = true
+	_view.mouse_filter = Control.MOUSE_FILTER_PASS
+	add_child(_view)
+
 	_canvas = FieldCanvas.new()
 	_canvas.name = "Field"
 	_canvas.ed = self
-	add_child(_canvas)
+	_view.add_child(_canvas)
 
 	var colour_label := UITheme.label("BRICK COLOUR", 10, Color(0.86, 0.78, 0.78))
 	colour_label.position = Vector2(12, 676)
@@ -216,6 +251,34 @@ func _build_ui() -> void:
 	bmenu.pressed.connect(func() -> void: Game.goto_menu())
 	action_row.add_child(bmenu)
 
+	# BRIEF 24 — UNDO / REDO and the view controls (zoom 1x-4x + pan mode).
+	# The zoom is the EDITOR's: the game screen has none (Part 3).
+	var history_row := HBoxContainer.new()
+	history_row.position = Vector2(10, 906)
+	history_row.size = Vector2(520, 28)
+	history_row.add_theme_constant_override("separation", 4)
+	add_child(history_row)
+	_undo_button = UITheme.button("UNDO", 11, Color(0.45, 0.62, 0.85), Vector2(84, 26))
+	_undo_button.pressed.connect(func() -> void: undo())
+	history_row.add_child(_undo_button)
+	_redo_button = UITheme.button("REDO", 11, Color(0.45, 0.62, 0.85), Vector2(84, 26))
+	_redo_button.pressed.connect(func() -> void: redo())
+	history_row.add_child(_redo_button)
+	_pan_button = UITheme.button("PAN", 11, Color(0.55, 0.68, 0.9), Vector2(64, 26))
+	_pan_button.toggle_mode = true
+	_pan_button.toggled.connect(func(on: bool) -> void: set_pan_mode(on))
+	history_row.add_child(_pan_button)
+	var bzout := UITheme.button("-", 15, Color(0.45, 0.55, 0.7), Vector2(40, 26))
+	bzout.pressed.connect(func() -> void: zoom_step(-1))
+	history_row.add_child(bzout)
+	var bzin := UITheme.button("+", 15, Color(0.45, 0.55, 0.7), Vector2(40, 26))
+	bzin.pressed.connect(func() -> void: zoom_step(1))
+	history_row.add_child(bzin)
+	var bz1 := UITheme.button("1x", 11, Color(0.5, 0.6, 0.75), Vector2(44, 26))
+	bz1.pressed.connect(func() -> void: reset_view())
+	history_row.add_child(bz1)
+	_sync_history_buttons()
+
 	_status_label = UITheme.label("", 10, Color(0.86, 0.9, 0.95))
 	_status_label.position = Vector2(12, 808)
 	_status_label.size = Vector2(516, 40)
@@ -258,6 +321,8 @@ func new_level(c: int, r: int) -> void:
 	_channel = {}
 	_loaded_id = ""
 	_loaded_json = ""
+	_no_channel_ok = false
+	reset_view()
 	if level_id == "" or level_id.begins_with("level_0"):
 		level_id = "editor_level"
 		display_name = "MY LEVEL"
@@ -265,13 +330,17 @@ func new_level(c: int, r: int) -> void:
 	carve_at(Vector2i(cols / 2, int(round(rows * 0.68))))
 	_build_palette()
 	_sync_fields()
+	# AFTER the default channel: a new level starts with nothing to undo.
+	_reset_history()
 	_refresh("new %dx%d level" % [cols, rows])
 
 
 func _clear_art() -> void:
+	var step := _begin_step()
 	_art.fill(Color(0, 0, 0, 0))
 	_refresh("grid cleared — the channel is still carved")
 	_dirty = true
+	_end_step(step)
 
 
 func colour_at(c: Vector2i) -> Color:
@@ -286,25 +355,33 @@ func paint_cell(c: Vector2i, col: Variant = null) -> void:
 	var use: Color = _palette[_palette_index] if _palette.size() > _palette_index else Color(0.647, 0.275, 0.275)
 	if col != null:
 		use = col
+	# One history step per gesture: inside a drag stroke the step is the whole
+	# stroke, so ten painted cells are ONE undo, not ten (BRIEF 24, Part 4).
+	var step := _begin_step()
 	if use.a < 0.5:
 		_art[c.y * cols + c.x] = Color(0, 0, 0, 0)
 	else:
 		_art[c.y * cols + c.x] = Color(use.r, use.g, use.b, 1.0)
 	_dirty = true
 	_refresh("")
+	_end_step(step)
 
 
 func erase_cell(c: Vector2i) -> void:
 	if c.x < 0 or c.y < 0 or c.x >= cols or c.y >= rows:
 		return
+	var step := _begin_step()
 	_art[c.y * cols + c.x] = Color(0, 0, 0, 0)
 	_dirty = true
 	_refresh("")
+	_end_step(step)
 
 
 ## Carve the Y channel with its fork at `fork`. Geometry comes from the loader's
 ## own carve_channel(); the tips are derived from the arm ends.
 func carve_at(fork: Vector2i) -> void:
+	var step := _begin_step()
+	_no_channel_ok = false
 	var fx := clampi(fork.x, 2, cols - 3)
 	var fy := clampi(fork.y, 3, rows - 2)
 	var arm_dx := maxi(3, mini(7, fx - 1))
@@ -321,13 +398,17 @@ func carve_at(fork: Vector2i) -> void:
 	_derive_tips()
 	_dirty = true
 	_refresh("channel carved — fork %s" % str(Vector2i(fx, fy)))
+	_end_step(step)
 
 
 func clear_channel() -> void:
+	var step := _begin_step()
 	_channel = {}
 	_tips = []
+	_no_channel_ok = false
 	_dirty = true
 	_refresh("channel removed")
+	_end_step(step)
 
 
 func _derive_tips() -> void:
@@ -351,21 +432,26 @@ func add_tip(cell_pos: Vector2i) -> void:
 	if not BreakoutLevelWriter.is_brick(carved["grid"], cols, rows, cell_pos):
 		_refresh("a power-up tip must be a brick — that cell is empty")
 		return
+	var step := _begin_step()
 	if _tips.has(cell_pos):
 		_tips.erase(cell_pos)
 		_refresh("tip removed")
+		_end_step(step)
 		return
 	if _tips.size() >= 2:
 		_tips.pop_front()
 	_tips.append(cell_pos)
 	_dirty = true
 	_refresh("power-up tip %s" % str(cell_pos))
+	_end_step(step)
 
 
 func set_border_solid(on: bool) -> void:
+	var step := _begin_step()
 	_border_solid = on
 	_dirty = true
 	_refresh("border is %s" % ("SOLID (unbreakable)" if on else "breakable"))
+	_end_step(step)
 
 
 func is_border_solid() -> bool:
@@ -463,8 +549,11 @@ func save_to(base_dir := "") -> Dictionary:
 		want_dir = BreakoutLevelWriter.RES_DIR
 	# Writing into user:// can never clobber a shipped file, so a shipped id is
 	# allowed there (that is the path PLAY uses); res:// needs OVERWRITE on.
+	# BRIEF 24 — an imported level is allowed to carry no channel: the art is
+	# the level, exactly as drawn. A blank/new level still needs its fork.
 	var check := BreakoutLevelWriter.validate(level_id, grid, cols, rows, _channel,
-		_tips, unb, allow_overwrite or want_dir == BreakoutLevelWriter.USER_DIR)
+		_tips, unb, allow_overwrite or want_dir == BreakoutLevelWriter.USER_DIR,
+		not _no_channel_ok)
 	if not bool(check.get("ok", false)):
 		_refresh("NOT SAVED — %s" % str(check.get("err", "")))
 		AudioManager.play("error")
@@ -546,6 +635,9 @@ func load_level_id(id: String) -> bool:
 	_loaded_json = json_path
 	_build_palette()
 	_sync_fields()
+	# BRIEF 24 — undo never jumps back into a different level.
+	reset_view()
+	_reset_history()
 	_dirty = false
 	AudioManager.play("confirm")
 	var cnt := counts()
@@ -585,6 +677,7 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 	# Adopt the new grid. `cell` only shrinks when the grid needs it (80x100 ->
 	# cell 6, exactly like the shipped Ronaldo level), so the field stays in
 	# the same 480x600 area and the portrait layout never changes.
+	var step := _begin_step()
 	cols = tc
 	rows = tr
 	cell = minf(DEFAULT_CELL, minf(480.0 / float(cols), 600.0 / float(rows)))
@@ -600,24 +693,28 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 				filled += 1
 			else:
 				_art[r * cols + c] = Color(0, 0, 0, 0)
-	# The channel is geometry, not art: keep a valid existing one, otherwise
-	# carve the default Y so the imported level has its two paths immediately.
-	# BRIEF 26 — IMPORT-TIME AUTO-CORRIDOR: Choubey ships portraits with the
-	# corridor's blank band built in, so when one is found IT sets the channel
-	# (never the default Y) and the grey bars around it become solid. Without a
-	# band the old keep-or-default-Y rule below still applies unchanged.
+	# The channel is geometry, not art.
+	#
+	# BRIEF 24 — NO DEFAULT Y ON IMPORT. An imported portrait is taken EXACTLY as
+	# drawn: no fork, no stem, no arms are carved into it, because the Y the old
+	# keep-or-default rule carved at (cols/2, 68% of the height) cut straight
+	# through the picture. The art's own corridor (the transparent pixels the
+	# artist drew, e.g. Ronaldo/Messi) stays exactly as drawn, and the designer
+	# can carve a channel by hand with the CHANNEL tool.
+	#
+	# BRIEF 26 — IMPORT-TIME AUTO-CORRIDOR is kept: a portrait that DOES ship a
+	# blank band for the corridor gets its channel set from that band (never a
+	# default Y), and the grey bars around it become solid. Any previous channel
+	# spec is dropped either way: it belonged to the art that was just replaced.
 	var band := find_blank_band(_art, cols, rows)
 	_band_solid = []
 	if not band.is_empty():
 		_set_band_channel(band)
 		_band_solid = _band_solid_cells(band)
+		_no_channel_ok = false
 	else:
-		var keep := not _channel.is_empty()
-		if keep:
-			var fork := _fork_cell()
-			keep = fork.x > 0 and fork.y > 0 and fork.x < cols and fork.y < rows
-		if not keep:
-			carve_at(Vector2i(cols / 2, int(round(rows * 0.68))))
+		_channel = {}
+		_no_channel_ok = true
 	_tips = []
 	_derive_tips()
 	_border_solid = true
@@ -633,7 +730,8 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 			_band_solid.size()]
 	_refresh("imported %s  •  %dx%d art stretched to %dx%d  •  %d bricks / %d breakable%s" % [
 		path.get_file(), src_w, src_h, cols, rows, int(cnt["bricks"]), int(cnt["breakable"]),
-		band_note])
+		band_note if not _channel.is_empty() else "  •  no channel carved (art as drawn)"])
+	_end_step(step)
 	return {"ok": true, "err": "", "cols": cols, "rows": rows,
 		"source_w": src_w, "source_h": src_h, "bricks": int(cnt["bricks"]),
 		"band_row": int(band.get("row", -1)), "band_cells": int(band.get("length", 0)),
@@ -893,6 +991,7 @@ func snapshot() -> Dictionary:
 		"art": _art.duplicate(), "channel": _channel.duplicate(true),
 		"tips": _tips.duplicate(), "border": _border_solid,
 		"band_solid": _band_solid.duplicate(),
+		"no_channel_ok": _no_channel_ok,
 		"allow_overwrite": allow_overwrite, "loaded_id": _loaded_id,
 		"loaded_json": _loaded_json,
 	}
@@ -918,6 +1017,9 @@ func restore(s: Dictionary) -> void:
 	for cell in (s.get("band_solid", []) as Array):
 		if cell is Vector2i:
 			_band_solid.append(cell)
+	_no_channel_ok = bool(s.get("no_channel_ok", false))
+	_reset_history()
+	reset_view()
 	allow_overwrite = bool(s.get("allow_overwrite", false))
 	_loaded_id = str(s.get("loaded_id", ""))
 	_loaded_json = str(s.get("loaded_json", ""))
@@ -1019,8 +1121,10 @@ func _refresh(message: String) -> void:
 	if _tips.is_empty() and not _channel.is_empty():
 		_derive_tips()
 	if _canvas != null:
-		_canvas.position = origin
-		_canvas.size = Vector2(cols * cell, rows * cell)
+		# BRIEF 24 — the canvas is placed and sized through the VIEW transform;
+		# `origin` and `cell` themselves are never touched by zooming.
+		_canvas.position = origin + _pan - (_view.position if _view != null else Vector2.ZERO)
+		_canvas.size = Vector2(cols * cell * _zoom, rows * cell * _zoom)
 		_canvas.queue_redraw()
 	if _status_label != null:
 		_status_label.text = _status
@@ -1040,7 +1144,10 @@ func status_text() -> String:
 ## Where the pointer landed, in grid space (used by the canvas, and directly by
 ## the editor test suite).
 func pointer(local: Vector2) -> void:
-	var c := Vector2i(floori(local.x / cell), floori(local.y / cell))
+	# BRIEF 24 — the pointer maps through the zoom, so the cell that gets painted
+	# is the one under the finger/mouse at ANY zoom level.
+	var pitch := cell * _zoom
+	var c := Vector2i(floori(local.x / pitch), floori(local.y / pitch))
 	if c.x < 0 or c.y < 0 or c.x >= cols or c.y >= rows:
 		_hover = Vector2i(-1, -1)
 		_canvas.queue_redraw()
@@ -1067,7 +1174,20 @@ func _apply(c: Vector2i) -> void:
 func _unhandled_key_input(event: InputEvent) -> void:
 	if not (event is InputEventKey) or not (event as InputEventKey).pressed:
 		return
-	match (event as InputEventKey).keycode:
+	var key := event as InputEventKey
+	# BRIEF 24 — desktop undo/redo. Ctrl+Z undoes; Ctrl+Y and Ctrl+Shift+Z redo.
+	if key.ctrl_pressed or key.meta_pressed:
+		match key.keycode:
+			KEY_Z:
+				if key.shift_pressed:
+					redo()
+				else:
+					undo()
+				return
+			KEY_Y:
+				redo()
+				return
+	match key.keycode:
 		KEY_1: set_tool(TOOL_PAINT)
 		KEY_2: set_tool(TOOL_ERASE)
 		KEY_3: set_tool(TOOL_CHANNEL)
@@ -1085,9 +1205,12 @@ func draw_field(c: Control) -> void:
 	var carved := _carved()
 	var grid: Array = carved["grid"]
 	var channel_cells: Array = carved["cells"]
-	var w := cols * cell
-	var h := rows * cell
-	var inner := cell - 2.0
+	# BRIEF 24 — `k` is the on-screen pitch: zoom only scales the DRAWING (and
+	# the pointer mapping), never the saved cell / origin.
+	var k := cell * _zoom
+	var w := cols * k
+	var h := rows * k
+	var inner := maxf(1.0, k - 2.0)
 
 	c.draw_rect(Rect2(Vector2(-8, -8), Vector2(w + 16, h + 16)),
 		pal.get("frame_dark", Color(0.28, 0.29, 0.33)))
@@ -1106,8 +1229,8 @@ func draw_field(c: Control) -> void:
 			var col: Color = grid[r * cols + col_i]
 			if col.a < 0.5:
 				continue
-			var x := float(col_i) * cell
-			var y := float(r) * cell
+			var x := float(col_i) * k
+			var y := float(r) * k
 			c.draw_rect(Rect2(x, y, inner, inner), col)
 			c.draw_rect(Rect2(x, y + inner - 1.5, inner, 1.5), col.darkened(0.35))
 			if unb.has(Vector2i(col_i, r)):
@@ -1117,29 +1240,265 @@ func draw_field(c: Control) -> void:
 	# the channel, always visible while editing
 	for cellv in channel_cells:
 		var cv: Vector2i = cellv
-		c.draw_rect(Rect2(cv.x * cell, cv.y * cell, cell, cell), Color(0.25, 0.85, 1.0, 0.16))
+		c.draw_rect(Rect2(cv.x * k, cv.y * k, k, k), Color(0.25, 0.85, 1.0, 0.16))
 
 	# grid lines every 5 cells, so the designer can count
 	var line := Color(1, 1, 1, 0.05)
 	for col_i in range(5, cols, 5):
-		c.draw_line(Vector2(col_i * cell, 0), Vector2(col_i * cell, h), line, 1.0)
+		c.draw_line(Vector2(col_i * k, 0), Vector2(col_i * k, h), line, 1.0)
 	for r in range(5, rows, 5):
-		c.draw_line(Vector2(0, r * cell), Vector2(w, r * cell), line, 1.0)
+		c.draw_line(Vector2(0, r * k), Vector2(w, r * k), line, 1.0)
 
 	# power-up tips
 	for t in _tips:
 		var tv: Vector2i = t
-		var ctr := Vector2(tv.x * cell + cell * 0.5, tv.y * cell + cell * 0.5)
-		c.draw_circle(ctr, cell * 0.34, Color(0.98, 0.82, 0.28, 0.95))
+		var ctr := Vector2(tv.x * k + k * 0.5, tv.y * k + k * 0.5)
+		c.draw_circle(ctr, k * 0.34, Color(0.98, 0.82, 0.28, 0.95))
 
 	if _hover.x >= 0:
-		c.draw_rect(Rect2(_hover.x * cell, _hover.y * cell, cell, cell),
+		c.draw_rect(Rect2(_hover.x * k, _hover.y * k, k, k),
 			Color(1, 1, 1, 0.9), false, 1.5)
+
+
+# ------------------------------------------------ view transform + history
+# Everything below is BRIEF 24's editor-only view (zoom / pan) and the
+# undo/redo history. None of it is written into the level data.
+
+## Zoom so the content under `local_point` (canvas-local) stays under it.
+func zoom_at(target: float, local_point: Vector2) -> void:
+	var z1 := clampf(target, ZOOM_MIN, ZOOM_MAX)
+	if is_equal_approx(z1, _zoom):
+		return
+	var view_origin := _view.position if _view != null else Vector2.ZERO
+	var editor_point := view_origin + _canvas.position + local_point
+	var u := local_point / _zoom
+	_zoom = z1
+	if is_equal_approx(_zoom, ZOOM_MIN):
+		_pan = Vector2.ZERO
+	else:
+		_pan = editor_point - u * _zoom - origin
+		_clamp_pan()
+	_refresh("zoom %.2fx" % _zoom)
+
+
+func zoom() -> float:
+	return _zoom
+
+
+func set_zoom(z: float) -> void:
+	var center := Vector2(VIEW.x, VIEW.y - FIELD_TOP) * 0.5
+	var local := center - (_canvas.position if _canvas != null else Vector2.ZERO)
+	zoom_at(z, local)
+
+
+func zoom_step(dir: int) -> void:
+	set_zoom(_zoom * (ZOOM_STEP if dir > 0 else 1.0 / ZOOM_STEP))
+
+
+func reset_view() -> void:
+	_zoom = ZOOM_MIN
+	_pan = Vector2.ZERO
+	_refresh("view reset to 1x")
+
+
+func pan_offset() -> Vector2:
+	return _pan
+
+
+func set_pan(p: Vector2) -> void:
+	_pan = p
+	_clamp_pan()
+	_refresh("")
+
+
+func pan_by(d: Vector2) -> void:
+	if _zoom <= ZOOM_MIN + 0.001:
+		# At 1x the whole grid is already visible: nothing to pan.
+		return
+	_pan += d
+	_clamp_pan()
+	_refresh("")
+
+
+## Keep at least 80 px of the grid inside the view, so it can never be lost.
+func _clamp_pan() -> void:
+	if _view == null:
+		return
+	var base := origin - _view.position
+	var w := cols * cell * _zoom
+	var h := rows * cell * _zoom
+	_pan.x = clampf(_pan.x, 80.0 - base.x - w, _view.size.x - 80.0 - base.x)
+	_pan.y = clampf(_pan.y, 80.0 - base.y - h, _view.size.y - 80.0 - base.y)
+
+
+func is_pan_mode() -> bool:
+	return _pan_mode
+
+
+func set_pan_mode(on: bool) -> void:
+	_pan_mode = on
+	if _pan_button != null and _pan_button.button_pressed != on:
+		_pan_button.button_pressed = on
+	_refresh("pan mode %s — drag to move the view" % ("ON" if on else "OFF"))
+
+
+## The cell under a canvas-local point at the current zoom (test + input use).
+func cell_under(local: Vector2) -> Vector2i:
+	var pitch := cell * _zoom
+	return Vector2i(floori(local.x / pitch), floori(local.y / pitch))
+
+
+## The canvas-local centre of a cell at the current zoom (tests paint through
+## `pointer()` with this, exactly like a finger on that cell).
+func cell_center_local(c: Vector2i) -> Vector2:
+	var pitch := cell * _zoom
+	return Vector2((float(c.x) + 0.5) * pitch, (float(c.y) + 0.5) * pitch)
+
+
+func field_size() -> Vector2:
+	return Vector2(cols * cell * _zoom, rows * cell * _zoom)
+
+
+# ------------------------------------------------ BRIEF 24 — undo / redo
+## Open a grouped edit (one drag stroke = ONE undo step).
+func begin_stroke() -> void:
+	if _stroke_open:
+		return
+	_stroke_before = _history_state()
+	_stroke_open = true
+
+
+## Close the grouped edit; nothing is recorded when the stroke changed nothing.
+func end_stroke() -> void:
+	if not _stroke_open:
+		return
+	_stroke_open = false
+	var after := _history_state()
+	if not _same_state(_stroke_before, after):
+		_push_undo(_stroke_before)
+	_stroke_before = {}
+
+
+## A discrete edit owns its own step; inside a stroke it just joins the stroke.
+func _begin_step() -> bool:
+	if _stroke_open:
+		return false
+	_stroke_before = _history_state()
+	_stroke_open = true
+	return true
+
+
+func _end_step(owned: bool) -> void:
+	if owned:
+		end_stroke()
+
+
+func undo() -> bool:
+	if _stroke_open:
+		end_stroke()
+	if _history.is_empty():
+		return false
+	_future.append(_history_state())
+	_apply_state(_history.pop_back())
+	_dirty = true
+	AudioManager.play("click")
+	_refresh("UNDO  •  %d step(s) left" % _history.size())
+	_sync_history_buttons()
+	return true
+
+
+func redo() -> bool:
+	if _future.is_empty():
+		return false
+	_history.append(_history_state())
+	_apply_state(_future.pop_back())
+	_dirty = true
+	AudioManager.play("click")
+	_refresh("REDO  •  %d step(s) left" % _future.size())
+	_sync_history_buttons()
+	return true
+
+
+func can_undo() -> bool:
+	return not _history.is_empty()
+
+
+func can_redo() -> bool:
+	return not _future.is_empty()
+
+
+func undo_depth() -> int:
+	return _history.size()
+
+
+func _push_undo(state: Dictionary) -> void:
+	_history.append(state)
+	if _history.size() > HISTORY_MAX:
+		_history.pop_front()
+	_future.clear()
+	_sync_history_buttons()
+
+
+func _reset_history() -> void:
+	_history.clear()
+	_future.clear()
+	_stroke_open = false
+	_stroke_before = {}
+	_sync_history_buttons()
+
+
+## A snapshot is the editable level state only (never the view).
+func _history_state() -> Dictionary:
+	return {"art": _art.duplicate(), "channel": _channel.duplicate(true),
+		"tips": _tips.duplicate(), "border": _border_solid,
+		"band": _band_solid.duplicate(), "no_channel": _no_channel_ok}
+
+
+func _apply_state(s: Dictionary) -> void:
+	_art = (s.get("art", []) as Array).duplicate()
+	if _art.size() != cols * rows:
+		_art = []
+		_art.resize(cols * rows)
+		_art.fill(Color(0, 0, 0, 0))
+	_channel = (s.get("channel", {}) as Dictionary).duplicate(true)
+	_tips = (s.get("tips", []) as Array).duplicate()
+	_border_solid = bool(s.get("border", true))
+	_band_solid = []
+	for cell in (s.get("band", []) as Array):
+		if cell is Vector2i:
+			_band_solid.append(cell)
+	_no_channel_ok = bool(s.get("no_channel", false))
+
+
+func _same_state(a: Dictionary, b: Dictionary) -> bool:
+	return a.get("art") == b.get("art") and a.get("channel") == b.get("channel") \
+		and a.get("tips") == b.get("tips") and bool(a.get("border", true)) == bool(b.get("border", true)) \
+		and a.get("band") == b.get("band") \
+		and bool(a.get("no_channel", false)) == bool(b.get("no_channel", false))
+
+
+func _sync_history_buttons() -> void:
+	if _undo_button != null:
+		_undo_button.disabled = _history.is_empty()
+		_undo_button.modulate = Color(0.55, 0.55, 0.58, 1.0) if _history.is_empty() else Color(1, 1, 1, 1)
+	if _redo_button != null:
+		_redo_button.disabled = _future.is_empty()
+		_redo_button.modulate = Color(0.55, 0.55, 0.58, 1.0) if _future.is_empty() else Color(1, 1, 1, 1)
+
+
+## The canvas entry for a press: pan mode moves the view, otherwise it paints.
+func press(local: Vector2) -> void:
+	if _pan_mode:
+		return
+	pointer(local)
 
 
 # ------------------------------------------------------------------ canvas
 class FieldCanvas extends Control:
 	var ed: BreakoutEditor
+	var _touches: Dictionary = {}      # touch index -> position (canvas-local)
+	var _pinch_dist := 0.0
+	var _pinch_mid := Vector2.ZERO
 
 	func _ready() -> void:
 		mouse_filter = Control.MOUSE_FILTER_STOP
@@ -1147,18 +1506,65 @@ class FieldCanvas extends Control:
 	func _gui_input(event: InputEvent) -> void:
 		if event is InputEventMouseButton:
 			var mb := event as InputEventMouseButton
-			if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed:
-				ed.pointer(mb.position)
+			if not mb.pressed:
+				if mb.button_index == MOUSE_BUTTON_LEFT:
+					ed.end_stroke()
+				return
+			if mb.button_index == MOUSE_BUTTON_WHEEL_UP:
+				# Desktop zoom, centred on the cursor.
+				ed.zoom_at(ed.zoom() * BreakoutEditor.ZOOM_STEP, mb.position)
+			elif mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				ed.zoom_at(ed.zoom() / BreakoutEditor.ZOOM_STEP, mb.position)
+			elif mb.button_index == MOUSE_BUTTON_LEFT:
+				ed.begin_stroke()
+				ed.press(mb.position)
 		elif event is InputEventMouseMotion:
 			var mm := event as InputEventMouseMotion
 			if (mm.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0:
-				ed.pointer(mm.position)
+				if ed.is_pan_mode():
+					ed.pan_by(mm.relative)
+				else:
+					ed.pointer(mm.position)
 		elif event is InputEventScreenTouch:
+			# Touch: one finger edits (or pans in PAN mode), two fingers pinch.
 			var st := event as InputEventScreenTouch
 			if st.pressed:
-				ed.pointer(st.position)
+				_touches[st.index] = st.position
+				_pinch_dist = 0.0
+				if _touches.size() == 1:
+					ed.begin_stroke()
+					ed.press(st.position)
+			else:
+				_touches.erase(st.index)
+				_pinch_dist = 0.0
+				if _touches.is_empty():
+					ed.end_stroke()
 		elif event is InputEventScreenDrag:
-			ed.pointer((event as InputEventScreenDrag).position)
+			var sd := event as InputEventScreenDrag
+			if _touches.has(sd.index):
+				_touches[sd.index] = sd.position
+			if _touches.size() >= 2:
+				_pinch()
+			elif ed.is_pan_mode():
+				ed.pan_by(sd.relative)
+			else:
+				ed.pointer(sd.position)
+
+	## Pinch: the zoom follows the distance between the two fingers and the view
+	## stays anchored on their midpoint (so a pinch also pans when it moves).
+	func _pinch() -> void:
+		var keys := _touches.keys()
+		if keys.size() < 2:
+			return
+		var p1: Vector2 = _touches[keys[0]]
+		var p2: Vector2 = _touches[keys[1]]
+		var d := p1.distance_to(p2)
+		var mid := (p1 + p2) * 0.5
+		if _pinch_dist > 0.0 and d > 0.5:
+			ed.zoom_at(ed.zoom() * d / _pinch_dist, mid)
+			ed.pan_by(mid - _pinch_mid)
+		_pinch_dist = d
+		_pinch_mid = mid
 
 	func _draw() -> void:
 		if ed != null:
