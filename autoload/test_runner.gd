@@ -1203,6 +1203,7 @@ func _suite_editor() -> void:
 		int(scene.bricks_left) if scene != null and scene.has_signal("game_ended") else -1])
 
 	await _check_editor_import(ed)
+	await _check_import_band_edge_open(ed)
 	await _check_import_no_default_y(ed)
 	await _check_editor_zoom(ed)
 	await _check_editor_undo(ed)
@@ -1297,6 +1298,170 @@ func _check_editor_import(ed: Node) -> void:
 		if FileAccess.file_exists(p):
 			DirAccess.remove_absolute(ProjectSettings.globalize_path(p))
 	Game.refresh_levels()
+
+
+# ------------------------------------------------------------ BRIEF 27 tests
+## BRIEF 27 — a corridor band that is OPEN TO A GRID EDGE must still be found.
+##
+## Kai's art leaves its blank band empty from col 0 to col 70, and the picture's
+## left margin has no brick row above it there, so the band's left end is stopped
+## by the grid edge instead of by a brick. Both import paths must set the corridor
+## FROM that band — the fork and stem INSIDE row 9, never the old default Y at
+## [40,68] — and mark the grey bar cells flanking it solid. The closed-band
+## portraits must be untouched: Pattinson and Speed keep their BRIEF 26 band (row
+## 14, fork [9,14], Pattinson 0 grey solid, Speed 122 grey cells listed) and
+## Ronaldo keeps its BRIEF 24 art-as-drawn import (checked by the suite that
+## follows this one).
+func _check_import_band_edge_open(ed: Node) -> void:
+	var src := "res://data/levels/level_08_kai.png"
+	var img: Image = BreakoutLevel.load_png_image(src)
+	if img == null:
+		_suite("editor_import_band_edge_open", false, "cannot decode %s" % src)
+		return
+	var gc := img.get_width()
+	var gr := img.get_height()
+
+	# --- IMPORT ANY ART, onto the art's own grid (no resampling)
+	ed.new_level(gc, gr)
+	var res: Dictionary = ed.import_art(src)
+	var band: Dictionary = ed.find_blank_band(ed._art, gc, gr)
+	var spec: Dictionary = ed.channel_spec()
+	var fork := _channel_fork(spec)
+	var stem_cols: Array = spec.get("stem_cols", []) if spec.get("stem_cols") is Array else []
+	var carved: Array = ed._carved()["cells"]
+	# Every carved cell must be on the band's row or in one of the two stem
+	# columns: a default-Y arm would show up here as cells anywhere else.
+	var off_channel := 0
+	for cellv in carved:
+		var cv: Vector2i = cellv
+		if cv.y != int(band.get("row", -1)) and not stem_cols.has(cv.x):
+			off_channel += 1
+	var y_default := int(round(gr * 0.68))
+	var default_y := false
+	for cellv in carved:
+		var cv2: Vector2i = cellv
+		if absi(cv2.x - gc / 2) <= 1 and absi(cv2.y - y_default) <= 1:
+			default_y = true
+	var solid_rows := {}
+	var solid_unbreakable := true
+	var unb: Array = ed.unbreakable_cells()
+	for s in ed._band_solid:
+		var sv: Vector2i = s
+		solid_rows[sv.y] = int(solid_rows.get(sv.y, 0)) + 1
+		if not unb.has(sv):
+			solid_unbreakable = false
+	var solid_flanks_only := true
+	for rr in solid_rows.keys():
+		if int(rr) != 9 - 1 and int(rr) != 9 + 1:
+			solid_flanks_only = false
+	var import_ok: bool = bool(res.get("ok", false)) \
+		and int(band.get("row", -1)) == 9 and int(res.get("band_row", -1)) == 9 \
+		and bool(band.get("open_left", false)) and not bool(band.get("open_right", false)) \
+		and int(band.get("first", -1)) == 2 and int(band.get("last", -1)) == 70 \
+		and fork.y == 9 and fork.x >= 2 and fork.x <= 70 \
+		and off_channel == 0 and not default_y \
+		and not ed._band_solid.is_empty() and solid_unbreakable and solid_flanks_only
+	_suite("editor_import_band_edge_open", import_ok,
+		"kai band row=%d cols %d..%d open_left=%s open_right=%s | fork=%s stem=%s carved=%d off_channel=%d default_y=%s | grey solid=%d rows=%s all_unbreakable=%s" % [
+			int(band.get("row", -1)), int(band.get("first", -1)), int(band.get("last", -1)),
+			str(band.get("open_left", false)), str(band.get("open_right", false)),
+			str(fork), str(stem_cols), carved.size(), off_channel, str(default_y),
+			ed._band_solid.size(), str(solid_rows.keys()), str(solid_unbreakable)])
+
+	# --- IMPORT PIXEL FILE: 1 pixel = 1 brick, auto-saved into user://levels
+	var px: Dictionary = ed.import_pixel_file(src)
+	var pid := str(px.get("id", ""))
+	var pjson := str(px.get("json", ""))
+	var plv: Dictionary = BreakoutLevel.load_level(pjson)
+	var pspec: Dictionary = {}
+	if pjson != "" and FileAccess.file_exists(pjson):
+		var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(pjson))
+		if parsed is Dictionary:
+			var pch: Variant = (parsed as Dictionary).get("channel", {})
+			if pch is Dictionary:
+				pspec = pch
+	var pfork := _channel_fork(pspec)
+	# The JSON round-trip turns the stem columns into floats: compare as ints.
+	var pstem_f: Array = pspec.get("stem_cols", []) if pspec.get("stem_cols") is Array else []
+	var pstem: Array = []
+	for sc in pstem_f:
+		pstem.append(int(sc))
+	# What the pixel import's own level carries: its band detection, its grey
+	# solids and the channel the loader will carve (import_pixel_file returns a
+	# save summary, not the band fields of import_art).
+	var pband: Dictionary = ed.find_blank_band(ed._art, gc, gr)
+	var psolid_rows := {}
+	for s in ed._band_solid:
+		var psv: Vector2i = s
+		psolid_rows[psv.y] = int(psolid_rows.get(psv.y, 0)) + 1
+	var pcarved: Array = plv.get("channel_cells", [])
+	var loader_stem: Array = plv.get("stem_cols", []) if plv.get("stem_cols") is Array else []
+	var pixel_off_channel := 0
+	for cellv in pcarved:
+		var pcv: Vector2i = cellv
+		if pcv.y != 9 and not pstem.has(pcv.x):
+			pixel_off_channel += 1
+	var pixel_ok: bool = bool(px.get("ok", false)) and bool(plv.get("ok", false)) \
+		and int(pband.get("row", -1)) == 9 and pfork.y == 9 and pfork.x >= 2 and pfork.x <= 70 \
+		and pfork != Vector2i(gc / 2, y_default) and pstem.size() == 2 \
+		and loader_stem.size() == 2 and int(loader_stem[0]) == pfork.x \
+		and pcarved.size() > 0 and pixel_off_channel == 0 \
+		and not ed._band_solid.is_empty() \
+		and int(psolid_rows.get(9, 0)) == 0 \
+		and int(px.get("unbreakable", -1)) == int(plv.get("unbreakable", 0)) \
+		and int(plv.get("breakable", 0)) == int(px.get("breakable", -1))
+	_suite("editor_pixel_import_band_edge_open", pixel_ok,
+		"pixel id=%s grid=%dx%d fork=%s stem=%s channel=%d off_channel=%d grey solid=%d rows=%s breakable=%d unbreakable=%d saved=%s" % [
+			pid, int(plv.get("cols", 0)), int(plv.get("rows", 0)), str(pfork), str(pstem),
+			pcarved.size(), pixel_off_channel, ed._band_solid.size(), str(psolid_rows),
+			int(plv.get("breakable", 0)), int(plv.get("unbreakable", 0)),
+			str(FileAccess.file_exists(pjson))])
+
+	# --- the closed-band portraits import exactly as they did in BRIEF 26
+	var closed_ok := true
+	var closed_detail := ""
+	for pairv in [["res://data/levels/level_06_pattinson.png", 0],
+			["res://data/levels/level_07_speed.png", 122]]:
+		var path := str(pairv[0])
+		var want_grey := int(pairv[1])
+		ed.new_level(80, 100)
+		var r2: Dictionary = ed.import_art(path)
+		var f2 := _channel_fork(ed.channel_spec())
+		var ok2: bool = bool(r2.get("ok", false)) and int(r2.get("band_row", -1)) == 14 \
+			and f2 == Vector2i(9, 14) and int(r2.get("band_solid", -1)) == want_grey \
+			and not bool(r2.get("band_open_left", false)) \
+			and not bool(r2.get("band_open_right", false))
+		closed_ok = closed_ok and ok2
+		closed_detail += "%s band_row=%d fork=%s grey=%d open=(%s,%s) %s | " % [
+			path.get_file(), int(r2.get("band_row", -1)), str(f2),
+			int(r2.get("band_solid", -1)), str(r2.get("band_open_left", false)),
+			str(r2.get("band_open_right", false)), "PASS" if ok2 else "FAIL"]
+	_suite("editor_import_closed_band_unchanged", closed_ok, closed_detail)
+
+	# keep=1 leaves the imported levels on disk for a following --breakout-sim.
+	if _args.has("keep=1"):
+		print("WR_BREAKOUT_BAND_KEPT id=%s json=%s band_row=%d fork=%s grey=%d" % [
+			pid, pjson, int(pband.get("row", -1)), str(pfork), int(psolid_rows.get(8, 0)) + int(psolid_rows.get(10, 0))])
+		for extra in ["res://data/levels/level_06_pattinson.png",
+				"res://data/levels/level_07_speed.png"]:
+			var ex: Dictionary = ed.import_pixel_file(str(extra))
+			print("WR_BREAKOUT_BAND_KEPT id=%s json=%s band_row=%d fork=%s grey=%d" % [
+				str(ex.get("id", "")), str(ex.get("json", "")),
+				int(ed.find_blank_band(ed._art, ed.cols, ed.rows).get("row", -1)),
+				str(_channel_fork(ed.channel_spec())), ed._band_solid.size()])
+	else:
+		# Leave nothing behind in the player's level folder.
+		for p in [pjson, str(px.get("png", ""))]:
+			if str(p) != "" and FileAccess.file_exists(str(p)):
+				DirAccess.remove_absolute(ProjectSettings.globalize_path(str(p)))
+	Game.refresh_levels()
+
+
+## The channel's fork cell, or (-1,-1) when the spec carries none.
+func _channel_fork(spec: Dictionary) -> Vector2i:
+	if spec.get("fork") is Array and (spec["fork"] as Array).size() == 2:
+		return Vector2i(int(spec["fork"][0]), int(spec["fork"][1]))
+	return Vector2i(-1, -1)
 
 
 # ------------------------------------------------------------ BRIEF 24 tests

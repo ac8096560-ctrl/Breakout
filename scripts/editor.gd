@@ -725,8 +725,18 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 	AudioManager.play("confirm")
 	var band_note := ""
 	if not band.is_empty():
-		band_note = "  •  blank band row %d: corridor auto-set (fork %s), %d grey frame cells solid" % [
-			int(band["row"]), str(Vector2i(int(_channel["fork"][0]), int(_channel["fork"][1]))),
+		# BRIEF 27 — say which ends of the band are open to the grid edge, so a
+		# designer can see the detector read their art the way they drew it.
+		var open_note := ""
+		if bool(band.get("open_left", false)) and bool(band.get("open_right", false)):
+			open_note = " (open to both edges)"
+		elif bool(band.get("open_left", false)):
+			open_note = " (open to the left edge)"
+		elif bool(band.get("open_right", false)):
+			open_note = " (open to the right edge)"
+		band_note = "  •  blank band row %d%s: corridor auto-set (fork %s), %d grey frame cells solid" % [
+			int(band["row"]), open_note,
+			str(Vector2i(int(_channel["fork"][0]), int(_channel["fork"][1]))),
 			_band_solid.size()]
 	_refresh("imported %s  •  %dx%d art stretched to %dx%d  •  %d bricks / %d breakable%s" % [
 		path.get_file(), src_w, src_h, cols, rows, int(cnt["bricks"]), int(cnt["breakable"]),
@@ -735,17 +745,33 @@ func import_art(path: String, target_cols := 0, target_rows := 0) -> Dictionary:
 	return {"ok": true, "err": "", "cols": cols, "rows": rows,
 		"source_w": src_w, "source_h": src_h, "bricks": int(cnt["bricks"]),
 		"band_row": int(band.get("row", -1)), "band_cells": int(band.get("length", 0)),
+		"band_first": int(band.get("first", -1)), "band_last": int(band.get("last", -1)),
+		"band_open_left": bool(band.get("open_left", false)),
+		"band_open_right": bool(band.get("open_right", false)),
 		"band_solid": _band_solid.size()}
 
 
 ## BRIEF 26 — find the corridor band in imported art: the longest horizontal run
 ## of EMPTY cells that has a brick row directly above and directly below it (1 or
 ## 2 rows tall, matching how Choubey draws it). Returns
-## {row, height, first, last, length} or {} when the art has no band.
+## {row, height, first, last, length, open_left, open_right} or {} when the art
+## has no band.
 ##
 ## Requiring bricks on both sides is what keeps open background out of the run:
 ## the portrait's transparent margin has no bricks above it. The length floor then
 ## rejects the short runs a portrait's shading leaves behind.
+##
+## BRIEF 27 — an END of the band may be OPEN: the run's own row can be empty all
+## the way to the grid edge on that side, because the picture's transparent
+## margin leaves no brick there (Kai's band is empty from col 0 to col 70; rows 7
+## and 8 have no brick at cols 0-1, so nothing stops the run at its left end).
+## An open end counts as a band end.
+##
+## What still rejects a candidate is a run that stops against nothing at all, and
+## a run that is open at BOTH ends: an empty row running from edge to edge is the
+## gap between two of the picture's bars (Kai's row 11), not the corridor slot the
+## designer left for the ball. At least one end must be a brick stop, which is the
+## original "between two frame bars" rule relaxed by exactly one end.
 func find_blank_band(grid: Array, c_count: int, r_count: int) -> Dictionary:
 	var best: Dictionary = {}
 	var need := maxi(BAND_MIN_CELLS, int(ceil(float(c_count) * BAND_MIN_FRACTION)))
@@ -758,18 +784,40 @@ func find_blank_band(grid: Array, c_count: int, r_count: int) -> Dictionary:
 					run_start = c
 				elif not in_band and run_start >= 0:
 					var length := c - run_start
-					# The band is a CLOSED slot: bricks at both of its ends ("between
-					# two frame bars"). Without that, an already-carved corridor left
-					# in a shipped PNG (Ronaldo's 2-row strip runs on past its stem)
-					# would read as a band and silently re-carve the level.
-					var closed := run_start > 0 and c < c_count \
-						and BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(run_start - 1, r)) \
+					# Each end is either STOPPED by a brick (the BRIEF 26 case) or OPEN
+					# to the grid edge (BRIEF 27); anything else — a run that stops on
+					# empty cells with a brick further away — is not a band (Ronaldo's
+					# 2-row strip: both of its ends trail off into the picture).
+					var left_stopped := BreakoutLevelWriter.is_brick(grid, c_count, r_count,
+						Vector2i(run_start - 1, r))
+					var right_stopped := c < c_count \
 						and BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r))
-					if closed and length >= need and length > int(best.get("length", 0)):
+					var left_open := not left_stopped \
+						and _band_edge_open(grid, c_count, r_count, run_start, r, -1)
+					var right_open := not right_stopped \
+						and _band_edge_open(grid, c_count, r_count, c, r, 1)
+					var ends_ok: bool = (left_stopped or left_open) and (right_stopped or right_open)
+					var one_stop := left_stopped or right_stopped
+					if ends_ok and one_stop and length >= need \
+							and length > int(best.get("length", 0)):
 						best = {"row": r, "height": height, "first": run_start,
-							"last": c - 1, "length": length}
+							"last": c - 1, "length": length,
+							"open_left": left_open, "open_right": right_open}
 					run_start = -1
 	return best
+
+
+## Is every cell on row `r` from `from_col` to the grid edge (stepping in
+## `dir`) empty? A band that runs off the picture into its transparent margin
+## ends on the grid edge, not on a brick.
+func _band_edge_open(grid: Array, c_count: int, r_count: int, from_col: int, r: int,
+		dir: int) -> bool:
+	var c := from_col
+	while c >= 0 and c < c_count:
+		if BreakoutLevelWriter.is_brick(grid, c_count, r_count, Vector2i(c, r)):
+			return false
+		c += dir
+	return true
 
 
 ## Is (c, r) the first empty row of a band `height` rows tall, with bricks
@@ -798,12 +846,24 @@ func _set_band_channel(band: Dictionary) -> void:
 	# all the way to the bottom row) can never resolve — the vertical corridor is
 	# the stem itself, which stem_cols/stem_bottom carve.
 	var fx := clampi(mini(first_col + 1, last_col), 1, cols - 2)
+	# BRIEF 27 — one arm per END THAT HAS A WALL. An edge-open end runs off the
+	# grid edge with no brick past it, so an arm aimed there could never resolve
+	# to a tip (validate() would refuse). Such a band has exactly one wall, and
+	# both arms point at it: the corridor is the L the art draws (Kai: up the
+	# stem, along the blank band to its wall) instead of a Y into empty space.
+	var arms: Array = []
+	if not bool(band.get("open_left", false)):
+		arms.append([first_col, row])
+	if not bool(band.get("open_right", false)):
+		arms.append([last_col, row])
+	while arms.size() < 2:
+		arms.append((arms[0] as Array).duplicate())
 	_channel = {
 		"fork": [fx, row],
 		"stem_cols": [fx, fx + 1],
 		"stem_bottom": rows - 1,
 		"arm_width": 1,
-		"arms": [[last_col, row], [first_col, row]],
+		"arms": arms,
 	}
 
 
