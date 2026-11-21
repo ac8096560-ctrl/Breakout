@@ -214,28 +214,65 @@ static func encode_mp4(job: Dictionary) -> Dictionary:
 		"-color_primaries", "bt709", "-color_trc", "bt709",
 		"-movflags", "+faststart",
 	])
+	var duration := float(frames) / maxf(0.001, fps)
+	# BRIEF 28: the take's own audio→game-clock map, when the recorder built one.
+	# Each segment trims its span of the recorded WAV and re-times it with
+	# `atempo` (pitch-preserving), then `concat` joins them back into one stream.
+	var segments: Array = job.get("atempo_segments", []) if has_audio else []
+	var attempts: Array = []
+	if segments.size() >= 2:
+		var chain := _atempo_chain(segments, float(job.get("audio_seconds", 0.0)))
+		if chain != "":
+			var seg_args := args.duplicate()
+			seg_args.append_array(["-c:a", "aac", "-b:a", AUDIO_BITRATE,
+				"-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS)])
+			seg_args.append_array(["-filter_complex", chain, "-map", "0:v:0",
+				"-map", "[aout]", "-t", "%.6f" % duration])
+			seg_args.append(out)
+			attempts.append(seg_args)
 	if has_audio:
-		args.append_array(["-c:a", "aac", "-b:a", AUDIO_BITRATE,
-			"-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS)])
-		# A/V SYNC (brief 23, part A): the caller passes the take's OWN measured
-		# ratio between the audio it captured and the video it is writing. When
-		# they differ the audio is re-timed by exactly that factor, so both
-		# streams share one time base instead of the audio slowly running ahead.
-		# 1.0 (the normal case on a machine that keeps up) adds no filter at all.
+		# A/V SYNC (brief 23, part A) — THE FALLBACK, still measured per take.
+		# The caller passes the ratio between the audio it captured and the video
+		# it is writing; both streams then share one total length. 1.0 (the
+		# normal case) adds no filter. Kept for a take with no usable map, and
+		# as the retry if the segmented encode above cannot run.
 		var atempo := clampf(float(job.get("atempo", 1.0)), 0.5, 2.0)
 		var af := "apad"
 		if absf(atempo - 1.0) >= 0.0005:
 			af = "atempo=%.6f,apad" % atempo
+		var lin_args := args.duplicate()
+		lin_args.append_array(["-c:a", "aac", "-b:a", AUDIO_BITRATE,
+			"-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS)])
 		# Audio and video start together and END together. `apad` pads a tap that
 		# ended a block early with silence, and `-t` cuts both streams at the
 		# video's exact length. `-shortest` is NOT used: with an infinite apad
 		# stream it lets the container run past the last frame.
-		args.append_array(["-af", af, "-t", "%.6f" % (float(frames) / maxf(0.001, fps))])
-	args.append(out)
+		lin_args.append_array(["-af", af, "-t", "%.6f" % duration])
+		lin_args.append(out)
+		attempts.append(lin_args)
+	if attempts.is_empty():
+		var silent_args := args.duplicate()
+		silent_args.append(out)
+		attempts.append(silent_args)
 	var log: Array = []
-	var code := OS.execute(str(d.get("ffmpeg", "ffmpeg")), args, log, true)
-	var text := "\n".join(log)
-	if code != 0:
+	var code := -1
+	var text := ""
+	var used_segments := 0
+	for i in attempts.size():
+		var attempt: Array = attempts[i]
+		var a_log: Array = []
+		code = OS.execute(str(d.get("ffmpeg", "ffmpeg")), attempt, a_log, true)
+		log = a_log
+		text = "\n".join(log)
+		if code == 0 and FileAccess.file_exists(out) and _file_size(out) >= 1024:
+			used_segments = segments.size() if (i == 0 and segments.size() >= 2) else 0
+			break
+		# A failed attempt leaves nothing behind: the next one starts clean.
+		if FileAccess.file_exists(out):
+			DirAccess.remove_absolute(out)
+		if code == 0:
+			code = 1
+	if code != 0 or not FileAccess.file_exists(out):
 		if FileAccess.file_exists(out):
 			DirAccess.remove_absolute(out)
 		var first := ""
@@ -246,8 +283,6 @@ static func encode_mp4(job: Dictionary) -> Dictionary:
 				break
 		return {"ok": false, "err": "ffmpeg failed (exit %d): %s" % [code, first if first != "" else "no output"],
 			"bytes": 0, "cmd": " ".join(args), "log": text}
-	if not FileAccess.file_exists(out):
-		return {"ok": false, "err": "ffmpeg reported success but wrote no file", "bytes": 0, "cmd": " ".join(args), "log": text}
 	var size := 0
 	var f := FileAccess.open(out, FileAccess.READ)
 	if f != null:
@@ -256,7 +291,68 @@ static func encode_mp4(job: Dictionary) -> Dictionary:
 	if size < 1024:
 		DirAccess.remove_absolute(out)
 		return {"ok": false, "err": "the encoded file is empty (%d bytes)" % size, "bytes": 0, "cmd": " ".join(args), "log": text}
-	return {"ok": true, "err": "", "bytes": size, "cmd": " ".join(args), "log": text, "audio": has_audio}
+	return {"ok": true, "err": "", "bytes": size, "cmd": " ".join(args), "log": text,
+		"audio": has_audio, "segments": used_segments}
+
+
+## BRIEF 28: the take's own audio→game-clock map, as ONE FFmpeg filter chain.
+## Every segment consumes its own span of the recorded WAV and re-times it to
+## the game-time span it belongs to; `atempo` preserves pitch, and a segment
+## whose tempo is 1.0 costs a trim and nothing else. A segment may carry several
+## `atempo` STAGES (the recorder splits anything outside [0.5, 2.0] rather than
+## clamping it); the stages are chained, so their product is the segment's
+## exact tempo. `apad` then covers a tail that ended early, exactly like the
+## linear path.
+##
+## EXACT SEGMENT LENGTH (measured on a real take): `atempo` ends on its own
+## internal block boundary, so its output is up to ~40 ms shorter than
+## (end-start)/tempo — not the length the map promises. Concatenating 48 such
+## segments lost 0.459 s of timeline and placed every later sound earlier
+## (the drift that measured -0.24 s at the first brick and -0.47 s at the win).
+## Each segment therefore feeds a little extra source through its stages and is
+## cut to its exact intended length; the trim discards the feed-ahead, so the
+## segment is neither short nor duplicated and the concat cannot drift.
+static func _atempo_chain(segments: Array, audio_seconds: float) -> String:
+	const FEED := 0.10
+	var parts: Array = []
+	var labels: Array = []
+	for i in segments.size():
+		var s: Dictionary = segments[i]
+		var st := maxf(0.0, float(s.get("start", 0.0)))
+		var en := float(s.get("end", 0.0))
+		if audio_seconds > 0.0:
+			en = minf(en, audio_seconds)
+		if en <= st + 0.0005:
+			continue
+		var stages: Array = (s.get("stages", []) as Array).duplicate()
+		if stages.is_empty():
+			stages = [float(s.get("tempo", 1.0))]
+		var want := (en - st) / maxf(0.0001, float(s.get("tempo", 1.0)))
+		var feed := en + FEED
+		if audio_seconds > 0.0:
+			feed = minf(feed, audio_seconds)
+		var chain := "[1:a]atrim=start=%.6f:end=%.6f,asetpts=PTS-STARTPTS" % [st, feed]
+		for stage in stages:
+			var tp := clampf(float(stage), 0.5, 100.0)
+			if absf(tp - 1.0) >= 0.0005:
+				chain += ",atempo=%.6f" % tp
+		chain += ",apad=whole_dur=%.6f,atrim=0:%.6f" % [want, want]
+		var label := "[s%d]" % labels.size()
+		parts.append(chain + label)
+		labels.append(label)
+	if labels.size() < 2:
+		return ""
+	parts.append("%sconcat=n=%d:v=0:a=1,apad[aout]" % ["".join(labels), labels.size()])
+	return ";".join(parts)
+
+
+static func _file_size(path: String) -> int:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return 0
+	var n := int(f.get_length())
+	f.close()
+	return n
 
 
 ## ---------------------------------------------------------------- probing

@@ -26,6 +26,12 @@ var rate := 44100
 var channels := 2
 var frames_written := 0
 var dropped_blocks := 0
+## BRIEF 28: the tap's position on the RECORDER's physics clock — one entry per
+## rendered frame it was drained at: {"audio": seconds written, "phys": physics
+## frame}. That list IS the take's own map from audio samples to game time, and
+## it is what lets the audio be placed on the video's physics clock without any
+## hand-measured curve.
+var marks: Array = []
 
 var _capture: AudioEffectCapture = null
 var _bus := -1
@@ -63,6 +69,7 @@ func start(wav_path: String) -> bool:
 		return false
 	frames_written = 0
 	dropped_blocks = 0
+	marks.clear()
 	_peak = 0.0
 	_write_header(0)
 	if _capture != null:
@@ -110,6 +117,17 @@ func drain() -> void:
 	frames_written += buf.size()
 
 
+## BRIEF 28: stamp the tap's current write position with the recorder's physics
+## frame count. Called right after each drain(), so the marks follow the frames
+## the mixer actually produced — no sample is ever guessed at.
+func mark(phys_frame: int) -> void:
+	if not ok:
+		return
+	if not marks.is_empty() and int((marks[marks.size() - 1] as Dictionary).get("phys", -1)) == phys_frame:
+		return
+	marks.append({"audio": seconds(), "phys": phys_frame})
+
+
 ## Drop what is buffered without writing it (a paused game has no video either,
 ## so keeping the pause in the audio would desynchronise the two timelines).
 func discard() -> void:
@@ -141,7 +159,7 @@ func stop() -> Dictionary:
 	_patch_header(data_bytes)
 	var res := {"ok": frames_written > 0, "path": path, "seconds": seconds(),
 		"rate": rate, "channels": channels, "bytes": data_bytes, "peak": _peak,
-		"dropped_blocks": dropped_blocks,
+		"dropped_blocks": dropped_blocks, "marks": marks.duplicate(),
 		"err": "" if frames_written > 0 else "no audio was captured"}
 	if not res["ok"]:
 		# Never hand a zero-length WAV to the encoder.

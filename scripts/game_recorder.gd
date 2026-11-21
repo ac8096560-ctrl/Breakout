@@ -98,8 +98,15 @@ var _captured := 0
 var _slots: Array = []
 ## Wall-clock marks of game events, taken while recording (see note_event).
 var _events := {}
-var _period_us := 33333
 var _start_us := 0
+# BRIEF 28: THE VIDEO CLOCK IS THE PHYSICS CLOCK. `_start_phys` is the physics
+# frame the take began on, `_paused_phys` the physics frames that elapsed while
+# the game was paused (a pause is not a slow recording), and `_last_phys` the
+# count seen at the previous tick — which is how the paused frames are measured
+# exactly instead of approximated from a render delta.
+var _start_phys := 0
+var _paused_phys := 0
+var _last_phys := 0
 # M-H: the frame writer. The main thread reads the viewport and hands the image
 # over; this thread crops, encodes and writes it. _cap_mutex guards the queue
 # and the counters below; the semaphore wakes the worker once per hand-off.
@@ -292,11 +299,25 @@ func elapsed_seconds() -> float:
 	return float(_frames) / maxf(1.0, float(settings.get("fps", 30)))
 
 
-## How much of the take the game was actually RUNNING for: wall-clock since
-## START minus every paused millisecond. This is the timeline both the video
-## slots and the audio tap use, so it is also the honest denominator for a
-## capture rate (a paused game is not a slow recording).
+## BRIEF 28: THE TAKE'S TIMELINE IS THE GAME'S OWN CLOCK.
+## Physics frames elapsed since START, minus every frame that elapsed while the
+## game was paused (a pause is not a slow recording). Both the video's slots and
+## the audio's placement are derived from this one number.
+func recorded_physics() -> int:
+	if _start_us <= 0:
+		return 0
+	return maxi(0, Engine.get_physics_frames() - _start_phys - _paused_phys)
+
+
+## The take's timeline in GAME seconds — the clock the video's slots live on.
 func recorded_seconds() -> float:
+	return float(recorded_physics()) / maxf(1.0, float(Engine.physics_ticks_per_second))
+
+
+## The take's WALL length (pauses excluded). Never used for the timeline: it is
+## only the honest denominator for the machine's capture rate, because "this
+## machine drew 20 pictures in the last second" is a wall-clock statement.
+func wall_seconds() -> float:
 	if _start_us <= 0:
 		return 0.0
 	return maxf(0.0, float(Time.get_ticks_usec() - _start_us - _paused_us) / 1000000.0)
@@ -309,7 +330,7 @@ func recorded_seconds() -> float:
 func capture_stats() -> Dictionary:
 	var real := 0.0
 	if _start_us > 0:
-		real = recorded_seconds()
+		real = wall_seconds()
 	elif not last_result.is_empty():
 		real = float(last_result.get("real_seconds", 0.0))
 	_mutex.lock()
@@ -440,6 +461,7 @@ func start(opts: Dictionary = {}) -> Dictionary:
 	_cap_overflow = 0
 	_last_push_slot = -1
 	_paused_us = 0
+	_paused_phys = 0
 	_progress = 0
 	_job_error = ""
 	_job_result = {}
@@ -458,8 +480,11 @@ func start(opts: Dictionary = {}) -> Dictionary:
 	_out_path = _unique_path(dir.path_join(base + (".mp4" if _use_mp4 else ".avi")))
 	_cap_quality = clampf(MP4_CAPTURE_QUALITY if _use_mp4 else float(settings["quality"]), 0.3, 1.0)
 	_cap_ratio = float(settings["width"]) / float(settings["height"])
-	_period_us = maxi(1000, int(round(1000000.0 / float(settings["fps"]))))
 	_start_us = Time.get_ticks_usec()
+	# BRIEF 28: both streams are stamped against this physics frame from here on.
+	_start_phys = Engine.get_physics_frames()
+	_paused_phys = 0
+	_last_phys = _start_phys
 	# M-G: tap the game's mixed audio for the MP4 path. A machine without an
 	# audio output (or without AAC) simply records video — never an error.
 	_audio = null
@@ -467,6 +492,11 @@ func start(opts: Dictionary = {}) -> Dictionary:
 		var tap := AudioCapture.new()
 		if tap.start(_frame_dir.path_join(AUDIO_TMP)):
 			_audio = tap
+			# BRIEF 28: the take's audio map has an ORIGIN (audio 0 ↔ game 0).
+			# Without this stamp the first entry is the first DRAIN, which arrives
+			# after the take's slowest frame — and measuring from there shifts
+			# every later sound earlier by that stall.
+			tap.mark(0)
 		else:
 			_start_note += " (audio unavailable: %s)" % tap.err
 	# M-H: the writer thread must exist before the first frame can be handed off.
@@ -507,8 +537,8 @@ func stop() -> Dictionary:
 		_set_state(STATE_IDLE)
 		_restore_title()
 		return {"ok": false, "err": writer_err, "path": ""}
-	# M-J: the take's length is the wall clock's, and the finalizer spreads the
-	# captured pictures over it evenly — there is no tail to fill by hand.
+	# BRIEF 28: the take's length is its PHYSICS clock's, and the finalizer lays
+	# the captured pictures out on that same clock — no tail to fill by hand.
 	_frames = _total_slots()
 	if _captured <= 0 or _frames <= 0:
 		var why := "no frames were captured — the viewport could not be read"
@@ -526,12 +556,14 @@ func stop() -> Dictionary:
 		"fps": float(settings["fps"]), "quality": float(settings["quality"]),
 		"out": _out_path, "frame_dir": _frame_dir,
 		"captured": _captured,
-		"real_seconds": recorded_seconds(),
+		"real_seconds": wall_seconds(),
 		"cap_read_us": _cap_read_us, "cap_enc_us": _cap_enc_us, "cap_wr_us": _cap_wr_us,
 		"render_frames": _render_frames, "cap_main_us": _cap_main_us, "overflow": _cap_overflow,
 		"mp4": _use_mp4, "wav": str(audio.get("path", "")) if bool(audio.get("ok", false)) else "",
 		"audio_seconds": float(audio.get("seconds", 0.0)), "audio_peak": float(audio.get("peak", 0.0)),
 		"slots": _slots.duplicate(), "events": _events.duplicate(),
+		"audio_marks": (audio.get("marks", []) as Array).duplicate(),
+		"phys_per_sec": int(Engine.physics_ticks_per_second),
 		"crf": crf_for(float(settings["quality"])), "note": _start_note,
 	}
 	_thread = Thread.new()
@@ -589,17 +621,16 @@ func _on_frame_post_draw() -> void:
 ## disk write — the three costs that used to stall the race — happen on that
 ## thread. On this machine that is ~47 ms of the ~55 ms a capture used to cost.
 func _capture_tick() -> void:
-	# TIMING IS DRIVEN BY THE WALL CLOCK, not by the render frame count. The
-	# target slot this frame belongs to is derived from real elapsed time; if
-	# the machine could not capture every slot, the previous frame is written
-	# again for the missed ones. The video therefore keeps its REAL duration
-	# (a 10 s recording is a 10 s video) and merely shows motion at the rate the
-	# machine managed, instead of playing the race back too fast.
-	var now := Time.get_ticks_usec()
-	if _start_us <= 0:
-		_start_us = now
-	# (Paused time is subtracted: a pause must not create a gap in the video.)
-	var slot := int((now - _start_us - _paused_us) / _period_us)
+	# BRIEF 28: TIMING IS DRIVEN BY THE PHYSICS CLOCK, not by the wall clock.
+	# The slot a picture belongs to is its PHYSICS frame on the video grid (60
+	# physics/s ÷ 30 video fps = 2 physics frames per slot), so a picture is
+	# stamped with the GAME time it shows. Before this, a picture carried the
+	# wall-clock moment it was DRAWN: while a take warms up (the first second
+	# renders at ~2 FPS) the picture lagged the sound by up to half a second, an
+	# error concentrated at the start that no constant atempo can repair. Paused
+	# frames are already excluded from `recorded_physics()`.
+	var slot := physics_slot(recorded_physics(),
+		int(Engine.physics_ticks_per_second), float(settings.get("fps", 30)))
 	if slot <= _last_push_slot:
 		return
 	var vp := get_viewport()
@@ -747,8 +778,8 @@ func _stop_capture_worker() -> void:
 	_cap_mutex.unlock()
 
 
-## How many OUTPUT frames (30 FPS slots) this take must have. It is the slot
-## clock's position at STOP — the same timeline the audio tap runs on — so the
+## How many OUTPUT frames (30 FPS slots) this take must have. It is the physics
+## clock's position at STOP — the same timeline the audio is placed on — so the
 ## video can never be shorter than the race, and the last fraction of a second
 ## (which has no captured picture) is covered by the pacing below instead of by
 ## a bespoke tail fill.
@@ -1040,6 +1071,187 @@ static func audio_time_scale(audio_seconds: float, video_seconds: float) -> floa
 	return clampf(ratio, SYNC_ATEMPO_MIN, SYNC_ATEMPO_MAX)
 
 
+## --------------------------------------------------------------------------
+## BRIEF 28 — THE AUDIO ON THE SAME CLOCK AS THE VIDEO
+##
+## Under software rendering the game runs slower than real time, and the take's
+## two streams were built from two different clocks:
+##   * the VIDEO's slots came from the WALL clock, so a picture was stamped with
+##     the moment it was DRAWN, not with the game state it shows;
+##   * the AUDIO tap captures the mixer in REAL time.
+## Within one take those two agree closely (a slow frame hears and shows the
+## same game state), which is why a constant ratio almost worked. The file is
+## now re-timed onto the GAME clock, so the audio must be re-timed by the same
+## LOCAL factor — not by one constant, because the machine's game/wall rate
+## changes during a take (it is worst exactly where the renderer is slowest).
+## Both streams therefore run on the PHYSICS clock:
+##   * `physics_slot()` gives a picture its video slot from the physics-frame
+##     count, and
+##   * the tap is stamped (`AudioCapture.mark`) with the physics frame it was
+##     drained at — including the origin at take start — which yields this
+##     take's OWN map from audio samples to game time. `audio_clock_segments()`
+##     turns that map into a short chain of pitch-preserving `atempo` segments
+##     (0.25 s through the warm-up, coarser after it), so each block of audio is
+##     placed where its physics frame is.
+## Nothing here is a constant: a take with no usable stamps yields no segments
+## and keeps the single-ratio correction as the safety net.
+
+## The video slot of a picture, from the take's physics-frame clock. 60 physics
+## frames/sec ÷ 30 video frames/sec = 2 physics frames per slot, so the slot
+## grid follows GAME time: a machine that only draws 2 pictures in a second
+## still gets the right number of slots for the physics frames that elapsed.
+static func physics_slot(phys_elapsed: int, phys_per_sec: int, fps: float) -> int:
+	var per := maxf(1.0, float(maxi(1, phys_per_sec)) / maxf(1.0, fps))
+	return int(floor(float(maxi(0, phys_elapsed)) / per))
+
+
+## The source-audio moment that belongs at `game_seconds` on the take's own
+## map ({audio, phys} stamps). Linear between stamps, held at the ends.
+static func audio_time_at(pts: Array, game_seconds: float) -> float:
+	if pts.is_empty():
+		return 0.0
+	var prev: Vector2 = pts[0]
+	if game_seconds <= prev.y:
+		return 0.0
+	for i in range(1, pts.size()):
+		var cur: Vector2 = pts[i]
+		if game_seconds <= cur.y:
+			var span := cur.y - prev.y
+			if span <= 0.0001:
+				return cur.x
+			return prev.x + (cur.x - prev.x) * ((game_seconds - prev.y) / span)
+		prev = cur
+	return prev.x
+
+
+## Where a source-audio moment lands on the game clock after the mapping. The
+## primitive the recorder test uses to prove the PLACEMENT, not just the count.
+static func clock_time_at(segments: Array, audio_t: float) -> float:
+	var t := 0.0
+	for s in segments:
+		var seg: Dictionary = s
+		var st := float(seg.get("start", 0.0))
+		var en := float(seg.get("end", 0.0))
+		var tp := maxf(0.0001, float(seg.get("tempo", 1.0)))
+		if audio_t < st:
+			return t
+		t += minf(en - st, maxf(0.0, audio_t - st)) / tp
+		if audio_t <= en + 0.0001:
+			return t
+	return t
+
+
+## THIS TAKE'S map from audio samples to game time, as atempo segments.
+##
+## `marks` are the tap's {audio, phys} stamps; `video_seconds` is how long the
+## video will be; `audio_seconds` is the WAV's length. Each segment carries the
+## span of the recorded WAV it consumes, the tempo (source span ÷ target span)
+## that turns it into the game-time span it belongs to, and the `atempo` stages
+## that realise that tempo legally. Empty means "no usable map" and the caller
+## keeps the old single-ratio correction.
+static func audio_clock_segments(marks: Array, video_seconds: float, phys_per_sec: int,
+		audio_seconds: float = 0.0, max_segments: int = 48) -> Array:
+	if video_seconds <= 0.0:
+		return []
+	var pps := float(maxi(1, phys_per_sec))
+	# The map's origin is the START OF THE TAKE (audio 0 ↔ game 0), never the
+	# first stamp: the first drain arrives after the take's first — and slowest —
+	# frame, so re-basing on it would shift every later sound EARLIER by exactly
+	# that stall. That is what a real take measured: -0.45 s at the first brick.
+	var pts: Array = [Vector2(0.0, 0.0)]
+	for m in marks:
+		if not (m is Dictionary):
+			continue
+		var d: Dictionary = m
+		var a := float(d.get("audio", -1.0))
+		if a < 0.0:
+			continue
+		var g := float(maxi(0, int(d.get("phys", 0)))) / pps
+		var last: Vector2 = pts[pts.size() - 1]
+		# A stamp that does not move forward carries no information and would
+		# break the inverse lookup.
+		if a <= last.x + 0.0005:
+			continue
+		pts.append(Vector2(a, maxf(last.y, g)))
+	if pts.size() < 3:
+		return []
+	# The map can end a frame before the video does: extend it with its own
+	# final slope instead of inventing a jump.
+	var lastp: Vector2 = pts[pts.size() - 1]
+	if lastp.y < video_seconds and pts.size() >= 2:
+		var prevp: Vector2 = pts[pts.size() - 2]
+		var slope := (lastp.x - prevp.x) / maxf(0.0001, lastp.y - prevp.y)
+		pts.append(Vector2(lastp.x + (video_seconds - lastp.y) * slope, video_seconds))
+	# Segment cuts in GAME time: fine through the warm-up (where the transient
+	# lives), coarse afterwards, and never more than `max_segments` of them.
+	var cuts: Array = []
+	var head := minf(video_seconds, 6.0)
+	var t := 0.0
+	while t < head - 0.0001:
+		cuts.append(t)
+		t += 0.25
+	var rest := video_seconds - t
+	if rest > 0.0001:
+		var left := maxi(1, max_segments - cuts.size())
+		var step := maxf(0.5, rest / float(left))
+		while t < video_seconds - 0.0001:
+			cuts.append(t)
+			t += step
+	cuts.append(video_seconds)
+	var out: Array = []
+	var a_prev := 0.0
+	for i in cuts.size() - 1:
+		var t0 := float(cuts[i])
+		var t1 := float(cuts[i + 1])
+		if t1 - t0 <= 0.0001:
+			continue
+		var a0 := a_prev
+		var a1 := audio_time_at(pts, t1)
+		if audio_seconds > 0.0:
+			a1 = minf(a1, audio_seconds)
+		if a1 <= a0 + 0.0001:
+			continue
+		var tempo := (a1 - a0) / (t1 - t0)
+		var stages := atempo_stages(tempo)
+		if stages.size() == 1:
+			tempo = float(stages[0])
+			a1 = a0 + tempo * (t1 - t0)
+		out.append({"start": a0, "end": a1, "tempo": tempo, "stages": stages})
+		a_prev = a1
+	if out.size() < 2:
+		return []
+	return out
+
+
+## One segment's tempo as legal `atempo` links. FFmpeg's filter is stable only
+## inside [0.5, 2.0] per link, so a segment that needs more is SPLIT into a
+## chain whose stages multiply back to the requested tempo — the mapping stays
+## exact. Clamping instead would re-time the segment wrongly and move every
+## sound after it.
+static func atempo_stages(tempo: float) -> Array:
+	if not is_finite(tempo) or tempo <= 0.0:
+		return [1.0]
+	var stages: Array = []
+	var t := tempo
+	while t > SYNC_ATEMPO_MAX and stages.size() < 3:
+		stages.append(SYNC_ATEMPO_MAX)
+		t /= SYNC_ATEMPO_MAX
+	while t < SYNC_ATEMPO_MIN and stages.size() < 3:
+		stages.append(SYNC_ATEMPO_MIN)
+		t /= SYNC_ATEMPO_MIN
+	if t > SYNC_ATEMPO_MAX or t < SYNC_ATEMPO_MIN:
+		# More than four links is not a correction, it is a broken map: keep the
+		# single legal ratio instead of an absurd chain.
+		return [clampf(tempo, SYNC_ATEMPO_MIN, SYNC_ATEMPO_MAX)]
+	var prod := 1.0
+	for s in stages:
+		prod *= float(s)
+	# The last link is the exact remainder, so the chain lands on the requested
+	# tempo and the segment still consumes exactly `end - start` of the WAV.
+	stages.append(clampf(tempo / prod, 0.01, 100.0))
+	return stages
+
+
 ## Quality setting -> H.264 CRF (lower is better). Constant quality keeps the
 ## flat game art clean without a bitrate to tune.
 func crf_for(quality: float) -> int:
@@ -1089,15 +1301,31 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 			idx += 1
 	result["hold_stats"] = hold_stats(holds)
 	frame_dir = seq
-	# PART A: the take's own drift, measured on the two lengths the file will
-	# actually have, and handed to the encoder so the audio is re-timed onto the
-	# video's clock. Nothing is corrected when the take is already in sync.
+	# BRIEF 28: place the audio on the video's clock. The tap's own physics
+	# stamps give THIS take's map from samples to game time, which the encoder
+	# turns into a short atempo chain — automatic, per take. The constant ratio
+	# is kept as the fallback (and is reported) only for a take whose stamps are
+	# missing or unusable; when the map is used the two are mutually exclusive,
+	# never stacked, because two corrections fighting each other is the failure
+	# this brief exists to remove.
 	var video_seconds := float(total) / maxf(0.001, fps)
 	var audio_seconds := float(job.get("audio_seconds", 0.0))
+	var segments: Array = []
+	if want_audio:
+		segments = audio_clock_segments(job.get("audio_marks", []), video_seconds,
+			int(job.get("phys_per_sec", 60)), audio_seconds)
 	var atempo := audio_time_scale(audio_seconds, video_seconds)
+	if segments.size() >= 2:
+		atempo = 1.0
 	result["sync_audio_seconds"] = audio_seconds
 	result["sync_video_seconds"] = video_seconds
 	result["sync_atempo"] = atempo
+	result["sync_clock"] = "game" if segments.size() >= 2 else "linear"
+	result["sync_segments"] = segments.size()
+	var stages_max := 1
+	for s in segments:
+		stages_max = maxi(stages_max, ((s as Dictionary).get("stages", []) as Array).size())
+	result["sync_stages_max"] = stages_max
 	_mutex.lock()
 	_progress = int(total * 0.15)     # the transcode itself reports no progress
 	_mutex.unlock()
@@ -1109,6 +1337,7 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 		"frame_dir": frame_dir, "frames": total, "fps": fps,
 		"width": w, "height": h, "out": out, "wav": wav,
 		"crf": int(job.get("crf", 20)), "atempo": atempo,
+		"atempo_segments": segments, "audio_seconds": audio_seconds,
 	})
 	result["encode_ms"] = Time.get_ticks_msec() - t_enc
 	_mutex.lock()
@@ -1118,6 +1347,14 @@ func _finalize_mp4(job: Dictionary, result: Dictionary) -> Dictionary:
 		result["err"] = str(enc.get("err", "the MP4 encoder failed"))
 		_remove_file(out)
 		return result
+	# The encoder reports which correction it ACTUALLY used, so the take's
+	# record can never claim a mapping that was silently dropped.
+	result["sync_segments"] = int(enc.get("segments", 0))
+	if int(enc.get("segments", 0)) >= 2:
+		result["sync_clock"] = "game"
+	elif str(result.get("sync_clock", "")) == "game":
+		result["sync_clock"] = "linear"
+		result["sync_stages_max"] = 0
 	# --- verify with an INDEPENDENT decoder: ffprobe re-reads the file --------
 	var info: Dictionary = VideoEncoder.probe(out)
 	if not bool(info.get("ok", false)):
@@ -1203,13 +1440,20 @@ func _process(delta: float) -> void:
 		# resuming continues where the pause started; the audio tap discards what
 		# the paused game played (nothing the player should hear in the video).
 		var paused_now := get_tree() != null and get_tree().paused
+		var phys_now := Engine.get_physics_frames()
 		if paused_now:
+			# BOTH clocks drop the pause: the wall milliseconds AND the physics
+			# frames that elapsed, so resuming continues where the pause started.
 			_paused_us += int(delta * 1000000.0)
+			_paused_phys += maxi(0, phys_now - _last_phys)
+		_last_phys = phys_now
 		if _audio != null:
 			if paused_now:
 				_audio.discard()
 			else:
 				_audio.drain()
+				# BRIEF 28: stamp the block with the physics frame it was mixed for.
+				_audio.mark(recorded_physics())
 		_title_t += delta
 		if _title_t >= 0.25:
 			_title_t = 0.0

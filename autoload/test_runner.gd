@@ -124,10 +124,127 @@ func _suite_all() -> void:
 	g7.queue_free()
 	await get_tree().process_frame
 
+	# BRIEF 28: the recorder's clocks are pure functions, so they are checked
+	# here — before the suites that need a live scene.
+	_check_recorder_clock()
+
 	# BRIEF 24 Part 2 changes scenes, so it runs last.
 	await _check_back_button()
 
 	await _report("WR_BREAKOUT_RESULT", _fails == 0, "failing suites: %d" % _fails)
+
+
+## BRIEF 28 — THE RECORDER'S CLOCKS. The video slots must come from the PHYSICS
+## clock and the audio must be placed on that same clock, from the take's own
+## audio↔physics stamps. These are the pure functions the take is built from, so
+## they can be proved with no display, no encoder and no recording at all.
+func _check_recorder_clock() -> void:
+	var ok := true
+	var detail: Array[String] = []
+	# 1. One second of GAME time is exactly 30 slots at 30 FPS (2 physics frames
+	#    per slot) — however many pictures the machine managed to draw in it.
+	var slots_1s := 0
+	for p in 60:
+		slots_1s = maxi(slots_1s, GameRecorder.physics_slot(p, 60, 30.0) + 1)
+	ok = ok and slots_1s == 30 \
+		and GameRecorder.physics_slot(0, 60, 30.0) == 0 \
+		and GameRecorder.physics_slot(1, 60, 30.0) == 0 \
+		and GameRecorder.physics_slot(2, 60, 30.0) == 1 \
+		and GameRecorder.physics_slot(59, 60, 30.0) == 29 \
+		and GameRecorder.physics_slot(60, 60, 30.0) == 30
+	detail.append("slots_per_game_second=%d" % slots_1s)
+	# 2. A SLOW CAPTURE still yields the right slot count: two pictures per
+	#    second (a 2 FPS warm-up) on a 2 s take were taken at physics frames
+	#    0/30/60/90, so they hold 30 slots each and the file still holds 120
+	#    frames. The slot count follows physics, not the capture rate.
+	var slow_slots: Array = [0, 30, 60, 90]
+	var holds: Array = GameRecorder.timeline_holds(slow_slots, slow_slots.size(), 120)
+	var hold_sum := 0
+	for h in holds:
+		hold_sum += int(h)
+	ok = ok and holds.size() == 4 and hold_sum == 120 \
+		and int(holds[0]) == 30 and int(holds[1]) == 30 and int(holds[3]) == 30
+	detail.append("slow_capture_holds=%s" % str(holds))
+	# 3. The AUDIO map: a take that ran at HALF game speed for its first 10 s of
+	#    audio and full speed after it (audio 10 s = game 5 s, audio 20 s = game
+	#    15 s). The segments must compress that early audio by ~2x, stay legal,
+	#    cover the whole video, and PLACE events where physics says they are.
+	var marks: Array = [
+		{"audio": 0.0, "phys": 0}, {"audio": 2.5, "phys": 75},
+		{"audio": 5.0, "phys": 150}, {"audio": 10.0, "phys": 300},
+		{"audio": 15.0, "phys": 600}, {"audio": 20.0, "phys": 900},
+	]
+	var segs: Array = GameRecorder.audio_clock_segments(marks, 15.0, 60, 20.0)
+	var covered := 0.0
+	var legal := segs.size() >= 2
+	var first_tempo := 1.0
+	for s in segs:
+		var seg: Dictionary = s
+		var tp := float(seg.get("tempo", 1.0))
+		covered += (float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))) / tp
+		legal = legal and tp >= 0.5 and tp <= 2.0
+	if not segs.is_empty():
+		first_tempo = float((segs[0] as Dictionary).get("tempo", 1.0))
+	# A sound heard 1 s into the WAV belongs at game 0.5 s; one heard at 11 s
+	# belongs at game 6.0 s (5 s of the slow section + 1 s at full speed).
+	var placed_early := GameRecorder.clock_time_at(segs, 1.0)
+	var placed_late := GameRecorder.clock_time_at(segs, 11.0)
+	ok = ok and legal and absf(covered - 15.0) <= 0.05 \
+		and absf(first_tempo - 2.0) <= 0.05 \
+		and absf(placed_early - 0.5) <= 0.02 \
+		and absf(placed_late - 6.0) <= 0.05
+	detail.append("audio_segments=%d covered=%.3f first_tempo=%.3f early=%.3f late=%.3f" % [
+		segs.size(), covered, first_tempo, placed_early, placed_late])
+	# 3b. THE ORIGIN IS THE TAKE'S START, NOT THE FIRST DRAIN. A real take's
+	#     first rendered frame is its slowest (0.45 s here), so the tap's first
+	#     stamp arrives AFTER it. Measuring the map from that stamp placed the
+	#     first brick 0.45 s EARLY on a real take (measured: -0.451 s). A sound
+	#     heard at audio 3.45 s must land at game 3.40 s, not at 3.00 s.
+	var late: Array = [
+		{"audio": 0.45, "phys": 24}, {"audio": 1.45, "phys": 84},
+		{"audio": 2.45, "phys": 144}, {"audio": 3.45, "phys": 204},
+		{"audio": 4.45, "phys": 264},
+	]
+	var late_segs: Array = GameRecorder.audio_clock_segments(late, 4.4, 60, 4.45)
+	var first_brick := GameRecorder.clock_time_at(late_segs, 3.45)
+	var take_end := GameRecorder.clock_time_at(late_segs, 4.45)
+	ok = ok and absf(first_brick - 3.40) <= 0.05 and absf(take_end - 4.40) <= 0.05
+	detail.append("late_first_frame offsets=%+.3f/%+.3f" % [first_brick - 3.40, take_end - 4.40])
+	# 3c. NO CLAMP. A segment whose own map asks for more than 2x (a hitch where
+	#     1 s of audio covers 0.2 s of game) is split into chained `atempo`
+	#     stages that multiply back to the requested tempo, so nothing after it
+	#     moves. Clamping it to 2.0 re-timed that stretch and everything after.
+	var hitch: Array = [
+		{"audio": 0.0, "phys": 0}, {"audio": 1.0, "phys": 60},
+		{"audio": 2.0, "phys": 72}, {"audio": 3.0, "phys": 132},
+		{"audio": 4.0, "phys": 192},
+	]
+	var hitch_segs: Array = GameRecorder.audio_clock_segments(hitch, 2.9, 60, 3.7)
+	var split_ok := false
+	var split_tempo := 0.0
+	var split_stages := 0
+	var hitch_covered := 0.0
+	for s in hitch_segs:
+		var seg2: Dictionary = s
+		var tp2 := float(seg2.get("tempo", 1.0))
+		hitch_covered += (float(seg2.get("end", 0.0)) - float(seg2.get("start", 0.0))) / tp2
+		var st2: Array = seg2.get("stages", [])
+		if tp2 > 2.0001:
+			var prod := 1.0
+			var each_legal := st2.size() >= 2
+			for v in st2:
+				prod *= float(v)
+				each_legal = each_legal and float(v) >= 0.4999 and float(v) <= 2.0001
+			split_ok = each_legal and absf(prod - tp2) <= 0.001
+			split_tempo = tp2
+			split_stages = st2.size()
+	ok = ok and split_ok and absf(hitch_covered - 2.9) <= 0.02
+	detail.append("hitch_tempo=%.2f stages=%d covered=%.3f" % [split_tempo, split_stages, hitch_covered])
+	# 4. No usable stamps = no map, so the linear safety net still owns the take.
+	ok = ok and GameRecorder.audio_clock_segments([], 15.0, 60, 20.0).is_empty() \
+		and is_equal_approx(GameRecorder.audio_time_scale(70.0, 70.0), 1.0) \
+		and absf(GameRecorder.audio_time_scale(10.0, 20.0) - 0.5) <= 0.001
+	_suite("recorder_physics_clock", ok, " ".join(detail))
 
 
 func _check_level_load() -> void:
@@ -2145,12 +2262,11 @@ func _suite_record() -> void:
 		int(res.get("dup_frames", 0)), float(res.get("duration", 0.0))])
 	# The A/V sync correction this take got, and the outcome it recorded, so a
 	# report never has to guess either one.
-	print("WR_BREAKOUT_RECORD_SYNC audio_seconds=%.3f video_seconds=%.3f atempo=%.6f residual=%.3f win_wall=%.3f" % [
+	print("WR_BREAKOUT_RECORD_SYNC clock=%s segments=%d stages=%d audio_seconds=%.3f video_seconds=%.3f atempo=%.6f win_game=%.3f" % [
+		str(res.get("sync_clock", "")), int(res.get("sync_segments", 0)),
+		int(res.get("sync_stages_max", 1)),
 		float(res.get("sync_audio_seconds", 0.0)), float(res.get("sync_video_seconds", 0.0)),
-		float(res.get("sync_atempo", 1.0)),
-		float(res.get("sync_audio_seconds", 0.0)) / maxf(0.0001, float(res.get("sync_atempo", 1.0))) \
-			- float(res.get("sync_video_seconds", 0.0)),
-		float(res.get("sync_win_seconds", -1.0))])
+		float(res.get("sync_atempo", 1.0)), float(res.get("sync_win_seconds", -1.0))])
 	# The take restarted the race, so the scene that was on screen when it began
 	# is gone: read the outcome from the LIVE scene instead.
 	var live: Node = get_tree().current_scene
