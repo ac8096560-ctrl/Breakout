@@ -6,7 +6,8 @@ class_name BreakoutLevel extends RefCounted
 ## JSON : id, display name, topic, image file name, grid geometry (columns,
 ##        rows, cell pitch, screen origin), the CARVED CHANNEL (stem + fork +
 ##        two arms — every level must give the ball a path and a choice point),
-##        the power-up tip cells, and the optional UNBREAKABLE CELLS — a
+##        the power-up tip cells, the optional win_leftover fraction (the win
+##        rule: see win_leftover_frac()), and the optional UNBREAKABLE CELLS — a
 ##        solid border ring listed explicitly as [col,row] pairs (never a
 ##        magic colour). Unbreakable cells are walls, not bricks: the ball
 ##        bounces off them, they are never broken, and they do not count
@@ -24,6 +25,19 @@ const DEFAULT_COLS := 40
 const DEFAULT_ROWS := 50
 const DEFAULT_CELL := 12.0
 const DEFAULT_ORIGIN := Vector2(30, 74)
+
+## --- BRIEF 29: the optional per-level WIN RULE -------------------------
+## `win_leftover` is the fraction of the level's BREAKABLE bricks that may
+## still stand when the win fires, so 0.0 means the picture must be completely
+## clear. It is validated HERE, once, at load, so a bad value in a level file
+## can never crash the game or quietly change the rule: a numeric value is
+## clamped to [WIN_LEFTOVER_MIN, WIN_LEFTOVER_MAX], and a non-numeric or
+## non-finite one falls back to WIN_LEFTOVER_UNSET. A level without the field
+## reports WIN_LEFTOVER_UNSET, which leaves the engine's own default (1.5%, see
+## WIN_LEFTOVER in breakout_game.gd) exactly as it was.
+const WIN_LEFTOVER_MIN := 0.0
+const WIN_LEFTOVER_MAX := 0.10
+const WIN_LEFTOVER_UNSET := -1.0
 
 ## --- AUTO-SOLID GREY (no more manual marking) ---------------------------
 ## Level art draws its walls and frame in GREY. Choubey paints levels as pixel
@@ -195,6 +209,7 @@ static func load_level(json_path: String) -> Dictionary:
 		"powerup_cells": tips,
 		"channel_cells": channel_cells,
 		"stem_cols": stem_cols,
+		"win_leftover": win_leftover_frac(d),
 		"bricks": bricks,
 		"unbreakable_cells": unbreakable,
 		"unbreakable": unbreakable.size(),
@@ -203,6 +218,26 @@ static func load_level(json_path: String) -> Dictionary:
 		"stranded_breakable": stranded,
 		"breakable": bricks - unbreakable.size(),
 	}
+
+
+## The level's `win_leftover` fraction (a share of its breakable bricks),
+## clamped to [WIN_LEFTOVER_MIN, WIN_LEFTOVER_MAX], or WIN_LEFTOVER_UNSET when
+## the level asks for the engine default. Never returns NaN/inf and never
+## fails: the win rule must exist for every level, even a hand-edited one.
+static func win_leftover_frac(d: Dictionary) -> float:
+	if not d.has("win_leftover"):
+		return WIN_LEFTOVER_UNSET
+	var raw: Variant = d["win_leftover"]
+	var v := 0.0
+	if raw is float or raw is int:
+		v = float(raw)
+	elif raw is String and (raw as String).is_valid_float():
+		v = float(raw)
+	else:
+		return WIN_LEFTOVER_UNSET
+	if not is_finite(v):
+		return WIN_LEFTOVER_UNSET
+	return clampf(v, WIN_LEFTOVER_MIN, WIN_LEFTOVER_MAX)
 
 
 ## Decode a PNG from ANY readable path — res:// inside an exported APK, an

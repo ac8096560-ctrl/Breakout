@@ -159,6 +159,11 @@ var origin := Vector2.ZERO
 var grid: Array = []
 var bricks_total := 0
 var bricks_left := 0
+## The fraction of bricks allowed to stand when the win fires: the global
+## WIN_LEFTOVER unless the level's JSON overrides it with `win_leftover` (the
+## loader clamps it to [0.0, 0.10]; 0.0 means the picture must be completely
+## clear). Set per level in _load_level().
+var win_leftover_frac := WIN_LEFTOVER
 var score := 0
 var score_mult := 1        # star bonus multiplier (1 = none)
 var star_left := 0.0       # seconds of x3 left
@@ -367,6 +372,13 @@ func _load_level() -> void:
 	# counting it would make a level unwinnable (it can never be broken).
 	bricks_total = int(level["breakable"])
 	bricks_left = bricks_total
+	# Brief 29: a level may demand a stricter win than the default 1.5%. The
+	# loader validates the value and reports WIN_LEFTOVER_UNSET when the level
+	# carries no field, so every other level keeps the old rule exactly.
+	win_leftover_frac = WIN_LEFTOVER
+	var level_win_leftover := float(level.get("win_leftover", BreakoutLevel.WIN_LEFTOVER_UNSET))
+	if level_win_leftover >= 0.0:
+		win_leftover_frac = level_win_leftover
 	for t in level["powerup_cells"]:
 		_tip_cells.append(t)
 	for u in level["unbreakable_cells"]:
@@ -553,7 +565,7 @@ func _on_all_balls_lost() -> void:
 
 
 func win_leftover() -> int:
-	return int(floor(float(bricks_total) * WIN_LEFTOVER))
+	return int(floor(float(bricks_total) * win_leftover_frac))
 
 
 func _finish(won: bool) -> void:
