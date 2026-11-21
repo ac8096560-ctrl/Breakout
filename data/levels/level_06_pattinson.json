@@ -10,6 +10,7 @@
   30,
   64
  ],
+ "win_leftover": 0.015,
  "pattern": "Choubey's v3 120x150 portrait art used exactly as drawn, one pixel per brick: Robert Pattinson in a tuxedo, inside a green picture frame. Choubey LEFT A BLANK BAND (row 14, black) between the frame's two green top bars (rows 11 and 17) FOR THE CORRIDOR \u2014 the ball's horizontal channel runs through this blank band, NOT through the hair or face. The green frame bars (rows 11, 17) and the left frame edge (cols 5-6) are SOLID (unbreakable) so the corridor walls stay intact. The right-side green corner shape (rows 37-42, cols 64-76) stays BREAKABLE. The black background outside the frame is empty. Fork at row 14 (the blank band); stem cols 9-10 to row 99; arms to col 67 (row 14) and down col 10 to row 95.",
  "channel": {
   "fork": [

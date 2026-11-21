@@ -10,6 +10,7 @@
     30,
     64
   ],
+  "win_leftover": 0.015,
   "pattern": "Kai Cenat portrait, black NY cap + headphones + dreadlocks + black hoodie + silver chain. Green/grey L-frame: green top bar row 5, grey bars rows 8/10/12, green bar row 13, green left edge cols 0-3, grey inner edge col 5 rows 14-63. BLACK BLANK BAND row 9 (corridor) between grey bars rows 8 and 10. Purple arrow cols 71-76 rows 5-10 (Choubey annotation, kept as-is). Corridor: LEFT STEM ONLY (Choubey 19 Nov: corridor is only on the left \u2014 horizontal arm REMOVED so the ball does not travel right along the top band). Fork [7,9], stem cols 6-7. The blank band row 9 is in the art; the ball enters only via the stem. Bottom rows 95-99 SOLID (unbreakable) so bricks never break from below \u2014 ball enters ONLY through the stem (Choubey 19 Nov). Background dark teal plaid cleared by flood-fill; rows 0-4, 6-7, 11 cleared (unreachable background).",
   "channel": {
     "fork": [

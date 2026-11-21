@@ -141,10 +141,15 @@ const COMBO_SCORE := 10
 ## the reference (whose first multi-ball lands around t=8s) instead of flooding
 ## the screen in the first two seconds.
 const DROP_DELAY := 4.5
-## "Clear (nearly) ALL the bricks" — the reference wins on a nearly-empty
-## field, and a 1% leftover also stops a single corner brick from stalling a
-## take forever. This is the win rule, not a scripted result.
-const WIN_LEFTOVER := 0.015
+## "Clear ALL the bricks" — the win fires only when the field is completely
+## clear (0 bricks left), so the portrait is fully gone when the win screen
+## appears. The old 1.5% leftover let the win fire with a strip of the
+## portrait still standing. A level with a stranded/unreachable brick would
+## now stall a take, so every level must pass the loader's stranded-brick
+## check (stranded_breakable == 0) before it ships; a level that genuinely
+## needs a nonzero leftover can still opt back in via its JSON `win_leftover`.
+## This is the win rule, not a scripted result.
+const WIN_LEFTOVER := 0.0
 const BUFF_SECONDS := 2.5
 
 var theme_id := "rose"

@@ -10,6 +10,7 @@
   30,
   64
  ],
+ "win_leftover": 0.015,
  "pattern": "Choubey's v2 240x300 portrait art used exactly as drawn, one pixel per brick: IShowSpeed in a Portugal #7 Ronaldo jersey, inside a green/grey picture frame. Choubey LEFT A BLANK BAND (row 14, black) between the frame's grey bars (rows 13 and 15) FOR THE CORRIDOR \u2014 the ball's horizontal channel runs through this blank band, NOT through the dreadlocks or face. The GREY bricks around the corridor are SOLID (unbreakable) per Choubey: grey bars rows 13 and 15 (the corridor walls), the green bars rows 11 and 17, and the left/right frame edges (cols 7-9 and 70-73). The right-side green corner shape (rows 37-42, cols 64-76) stays BREAKABLE. The black background outside the frame is empty. Fork at row 14 (the blank band); stem cols 9-10 to row 99; arms to col 67 (row 14) and down col 10 to row 95.",
  "channel": {
   "fork": [

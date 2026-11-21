@@ -10,6 +10,7 @@
   30,
   64
  ],
+ "win_leftover": 0.015,
  "pattern": "Choubey's 80x100 portrait art used exactly as drawn, one pixel per brick: the portrait is framed by a rectangular corridor (red-edged, grey solid walls, black 2-cell channel) whose turns run up the left edge, right along the top, down the right edge and into the small top-right hook. The grey walls are unbreakable so the ball has to be AIMED along them; the channel is the ball's path and never cuts the face. The empty cavity on the left is filled solid red so the ball cannot waste time there.",
  "channel": {
   "fork": [

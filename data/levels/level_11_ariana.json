@@ -10,6 +10,7 @@
     30,
     64
   ],
+  "win_leftover": 0.015,
   "pattern": "Muse-drawn original cartoon portrait of Ariana Grande as Glinda the Good Witch (blonde wavy hair, tiara, pink sparkly gown, wand), inside a green picture frame. Corridor (NEW U-shape, complex \u2014 Choubey 21 Nov): a LEFT VERTICAL channel (cols 3-6, 4 wide, rows 2-99), a TOP HORIZONTAL channel (rows 4-6, 3 tall, cols 2-77), and a RIGHT VERTICAL channel (cols 71-74, 4 wide, rows 7-99). The ball travels UP the left, ACROSS the top, DOWN the right \u2014 a longer journey with exits on BOTH sides. Both walls of every channel leg are GREY and SOLID (1 brick thick, unbreakable). The channel is minimum 3 bricks wide everywhere. Exits into the portrait: left wall (col 7) rows 15-25, 30-40, 60-70, 82-95; right wall (col 70) rows 20-30, 40-50, 60-70, 82-95; top exit row 7 cols 68-77. FAST START: the LOW exits (rows 82-95) sit right above the ball's entry, so the ball can exit the stem into the gown within ~2-3s of launch. The face (including eyes) is fully breakable. Rows 95-99 are a continuous barrier (every gap filled) but BREAKABLE; the green 2px border (rows 98-99) stays unbreakable so the ball enters only via the two channels. The right vertical channel is carved in the PNG; the JSON channel below covers the entry L (fork/stem/top arm) which the game carves. Fork at the top-left corner [4,5]; stem cols 3-6 to row 99; arms to col 77 (row 5) and down col 4 to row 95; arm_width 1.",
   "channel": {
     "fork": [
