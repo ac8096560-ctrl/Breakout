@@ -500,7 +500,8 @@ func is_channel_cell(c: Vector2i) -> bool:
 ## editor PREVIEW marks a grey wall as solid exactly like the game will, and a
 ## saved level lists it explicitly as well.
 func unbreakable_cells() -> Array:
-	var grid: Array = _carved()["grid"]
+	var carved := _carved()
+	var grid: Array = carved["grid"]
 	var listed: Array = []
 	if _border_solid:
 		listed = BreakoutLevelWriter.border_unbreakable(grid, cols, rows)
@@ -508,7 +509,9 @@ func unbreakable_cells() -> Array:
 	for cell in _band_solid:
 		if not listed.has(cell):
 			listed.append(cell)
-	return BreakoutLevel.solid_cells(grid, cols, rows, listed)
+	# BRIEF 30: the loader drops an inner grey ring that would strand bricks, so
+	# the preview must judge it with the same channel cells.
+	return BreakoutLevel.solid_cells(grid, cols, rows, listed, carved["cells"])
 
 
 func tips() -> Array:

@@ -62,6 +62,33 @@ const GREY_MAX_BRIGHTNESS := 200.0 # above this is a highlight, not a wall
 ## 2 covers a 1-cell frame and one cell of resize ringing around it.
 const GREY_FRAME_BAND := 2
 
+## --- BRIEF 30: THE INNER GREY FRAME -------------------------------------
+## Some art draws its frame as a grey RECTANGLE INSIDE an opaque border: the
+## Messi portrait's grey ring sits 3..21 cells in from the picture's edge, so
+## the 2-cell band above never sees it (a fresh import walled in 4 of its 294
+## frame cells, 1.4%), and such a level still had to be marked by hand.
+##
+## What separates a frame from portrait shading is SHAPE, not colour:
+##   * a frame side is a LONG straight grey line — at least half the picture's
+##     width or height — because it spans the picture;
+##   * it is THIN: a wall is 1..3 cells across, while a grey background or a
+##     shading block is many cells thick in the perpendicular direction;
+##   * it is FRAGMENTED, not continuous: a resize leaves single-cell gaps, so
+##     a side may skip up to GREY_RING_MAX_GAP non-grey cells;
+##   * it TURNS: a ring is a rectangle, so a side must meet a perpendicular
+##     side at a corner. A lone long grey line is a shadow, not a frame.
+## That is why level_04_ronaldo's neutral shading (302 grey cells, some in
+## 15..20-cell slivers inside the portrait) stays breakable, and why
+## level_02_jensen's 670-cell grey BACKGROUND (one thick block) is not a ring.
+##
+## The last guard is not colour at all: the ring is made solid only when it
+## does not cut a single breakable brick off from the level's channel — the
+## same stranded_breakable() rule a level must never break. A ring that walls
+## the portrait in is not a frame, and is dropped.
+const GREY_RING_LINE_FRAC := 0.5    # a side spans this share of the picture
+const GREY_RING_MAX_GAP := 2        # cells a fragmented side may skip
+const GREY_RING_MAX_THICKNESS := 3  # perpendicular grey run: wall, not block
+
 
 ## Load a level. Returns
 ##   {ok, err, id, name, topic, cols, rows, cell, origin, image,
@@ -182,14 +209,11 @@ static func load_level(json_path: String) -> Dictionary:
 		var cellp := Vector2i(int(u[0]), int(u[1]))
 		if _is_brick(grid, cols, rows, cellp) and not listed.has(cellp):
 			listed.append(cellp)
-	var grey_solid := grey_frame_cells(grid, cols, rows)
-	var unbreakable := solid_cells(grid, cols, rows, listed)
-	# "How many came from the grey rule": the cells that would have been
-	# BREAKABLE without it (a cell the JSON already listed is not its doing).
-	var from_grey := 0
-	for g in grey_solid:
-		if not listed.has(g):
-			from_grey += 1
+	var unbreakable := solid_cells(grid, cols, rows, listed, channel_cells)
+	# "How many came from the grey rule": every solid cell the JSON did not
+	# list. The solid set is the UNION of the list and the two grey rules, so
+	# the difference is exactly the rule's doing (no duplicates).
+	var from_grey := unbreakable.size() - listed.size()
 	var stranded := stranded_breakable(grid, cols, rows, unbreakable, channel_cells)
 
 	var origin := DEFAULT_ORIGIN
@@ -370,6 +394,27 @@ static func _is_grey_brick(grid: Array, cols: int, rows: int, cell: Vector2i) ->
 ##    leaves the background (and every photo's interior shading) breakable.
 static func grey_frame_cells(grid: Array, cols: int, rows: int) -> Array[Vector2i]:
 	var out: Array[Vector2i] = []
+	var b := _brick_bounds(grid, cols, rows)
+	if b.is_empty():
+		return out
+	var min_c: int = b[0]
+	var max_c: int = b[1]
+	var min_r: int = b[2]
+	var max_r: int = b[3]
+	for r in range(min_r, max_r + 1):
+		for c in range(min_c, max_c + 1):
+			var cell := Vector2i(c, r)
+			if not _is_grey_brick(grid, cols, rows, cell):
+				continue
+			var depth := mini(mini(c - min_c, max_c - c), mini(r - min_r, max_r - r))
+			if depth < GREY_FRAME_BAND:
+				out.append(cell)
+	return out
+
+
+## The brick bounding box of the picture: [min_col, max_col, min_row, max_row],
+## or [] when the grid holds no brick at all.
+static func _brick_bounds(grid: Array, cols: int, rows: int) -> Array:
 	var min_c := cols
 	var max_c := -1
 	var min_r := rows
@@ -382,20 +427,140 @@ static func grey_frame_cells(grid: Array, cols: int, rows: int) -> Array[Vector2
 				min_r = mini(min_r, r)
 				max_r = maxi(max_r, r)
 	if max_c < 0:
+		return []
+	return [min_c, max_c, min_r, max_r]
+
+
+## Every grey cell of the INNER GREY RING (BRIEF 30): the long, thin, fragmented
+## straight grey sides that turn corners into a rectangle. See the constants at
+## the top of the file for why each test exists; nothing here looks at the
+## picture's edge, so a frame 3..21 cells inside an opaque border is found.
+static func grey_ring_cells(grid: Array, cols: int, rows: int) -> Array[Vector2i]:
+	var out: Array[Vector2i] = []
+	var hs := _grey_ring_spans(grid, cols, rows, true)
+	var vs := _grey_ring_spans(grid, cols, rows, false)
+	if hs.is_empty() or vs.is_empty():
 		return out
-	for r in range(min_r, max_r + 1):
-		for c in range(min_c, max_c + 1):
-			var cell := Vector2i(c, r)
-			if not _is_grey_brick(grid, cols, rows, cell):
-				continue
-			var depth := mini(mini(c - min_c, max_c - c), mini(r - min_r, max_r - r))
-			if depth < GREY_FRAME_BAND:
+	# A ring is a rectangle: keep only sides that meet a perpendicular side at
+	# a corner (a lone long grey line is a shadow or a wall, not a frame).
+	var keep_h := {}
+	var keep_v := {}
+	for i in hs.size():
+		var h: Array = hs[i]
+		for j in vs.size():
+			var side: Array = vs[j]
+			if int(side[0]) >= int(h[1]) - GREY_RING_MAX_GAP \
+					and int(side[0]) <= int(h[2]) + GREY_RING_MAX_GAP \
+					and int(h[0]) >= int(side[1]) - GREY_RING_MAX_GAP \
+					and int(h[0]) <= int(side[2]) + GREY_RING_MAX_GAP:
+				keep_h[i] = true
+				keep_v[j] = true
+	for i in hs.size():
+		if not keep_h.has(i):
+			continue
+		var h: Array = hs[i]
+		for pos in h[3]:
+			var cell := Vector2i(int(pos), int(h[0]))
+			if not out.has(cell):
+				out.append(cell)
+	for j in vs.size():
+		if not keep_v.has(j):
+			continue
+		var side: Array = vs[j]
+		for pos in side[3]:
+			var cell := Vector2i(int(side[0]), int(pos))
+			if not out.has(cell):
 				out.append(cell)
 	return out
 
 
+## The long thin straight grey sides of ONE orientation, as
+## [line, first, last, cells] — line is a row for horizontal sides and a column
+## for vertical ones, first/last bound the span (gaps included), and cells are
+## the grey positions inside it. A side may skip up to GREY_RING_MAX_GAP
+## non-grey cells; the skipped cells are not part of the side.
+static func _grey_ring_spans(grid: Array, cols: int, rows: int, horizontal: bool) -> Array:
+	var out: Array = []
+	var b := _brick_bounds(grid, cols, rows)
+	if b.is_empty():
+		return out
+	var min_c: int = b[0]
+	var max_c: int = b[1]
+	var min_r: int = b[2]
+	var max_r: int = b[3]
+	var line_first := min_r if horizontal else min_c
+	var line_last := max_r if horizontal else max_c
+	var pos_first := min_c if horizontal else min_r
+	var pos_last := max_c if horizontal else max_r
+	var min_span := maxi(1, int(ceil(GREY_RING_LINE_FRAC * float(pos_last - pos_first + 1))))
+	for line in range(line_first, line_last + 1):
+		var pos := pos_first
+		while pos <= pos_last:
+			if not _is_grey_brick(grid, cols, rows, _ring_cell(line, pos, horizontal)):
+				pos += 1
+				continue
+			var start := pos
+			var last_grey := pos
+			var gaps := 0
+			var cells: Array[int] = [pos]
+			pos += 1
+			while pos <= pos_last:
+				if _is_grey_brick(grid, cols, rows, _ring_cell(line, pos, horizontal)):
+					gaps = 0
+					last_grey = pos
+					cells.append(pos)
+					pos += 1
+				elif gaps < GREY_RING_MAX_GAP:
+					gaps += 1
+					pos += 1
+				else:
+					break
+			if last_grey - start + 1 >= min_span and _grey_ring_side_is_thin(
+					grid, cols, rows, line, cells, horizontal):
+				out.append([line, start, last_grey, cells])
+			pos = maxi(pos, last_grey + 1)
+	return out
+
+
+## A side is a WALL, not a block: at most half of its cells are thicker than
+## GREY_RING_MAX_THICKNESS across. A frame's sides are 1..3 cells wide even
+## where a bar's corner is crossed by another line; a grey background fails
+## everywhere.
+static func _grey_ring_side_is_thin(grid: Array, cols: int, rows: int, line: int,
+		cells: Array[int], horizontal: bool) -> bool:
+	var thick := 0
+	for pos in cells:
+		if _grey_ring_run(grid, cols, rows, line, pos, horizontal) > GREY_RING_MAX_THICKNESS:
+			thick += 1
+	return thick * 2 <= cells.size()
+
+
+## How many grey cells thick the picture is ACROSS one side cell, capped at
+## GREY_RING_MAX_THICKNESS + 1 (the cap is all the thin test needs).
+static func _grey_ring_run(grid: Array, cols: int, rows: int, line: int, pos: int,
+		horizontal: bool) -> int:
+	var n := 1
+	for step in [-1, 1]:
+		var across: int = line + step
+		while n <= GREY_RING_MAX_THICKNESS:
+			var cell := Vector2i(pos, across) if horizontal else Vector2i(across, pos)
+			if not _is_grey_brick(grid, cols, rows, cell):
+				break
+			n += 1
+			across += step
+	return n
+
+
+static func _ring_cell(line: int, pos: int, horizontal: bool) -> Vector2i:
+	return Vector2i(pos, line) if horizontal else Vector2i(line, pos)
+
+
 ## THE FINAL SOLID SET: the level's explicit list UNION the auto-solid greys.
-static func solid_cells(grid: Array, cols: int, rows: int, listed: Array) -> Array[Vector2i]:
+## `from` are the cells the ball travels from (the carved channel; empty for an
+## import taken exactly as drawn). The BRIEF 30 ring is applied only when it
+## strands no breakable brick — a ring that walls the portrait in is not a frame.
+static func solid_cells(grid: Array, cols: int, rows: int, listed: Array,
+		from: Array = []) -> Array[Vector2i]:
 	var out: Array[Vector2i] = []
 	for u in listed:
 		if not (u is Vector2i):
@@ -406,6 +571,19 @@ static func solid_cells(grid: Array, cols: int, rows: int, listed: Array) -> Arr
 	for g in grey_frame_cells(grid, cols, rows):
 		if not out.has(g):
 			out.append(g)
+	var ring := grey_ring_cells(grid, cols, rows)
+	if not ring.is_empty():
+		var trial: Array[Vector2i] = out.duplicate()
+		for g in ring:
+			if not trial.has(g):
+				trial.append(g)
+		var before := 0
+		var after := 0
+		if not from.is_empty():
+			before = stranded_breakable(grid, cols, rows, out, from)
+			after = stranded_breakable(grid, cols, rows, trial, from)
+		if after <= before:
+			out = trial
 	return out
 
 
